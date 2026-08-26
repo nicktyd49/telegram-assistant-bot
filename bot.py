@@ -80,6 +80,7 @@ def calendar_inline_keyboard() -> InlineKeyboardMarkup:
     """Sub-menu shown after tapping the Calendar button."""
     return InlineKeyboardMarkup(
         [
+            [InlineKeyboardButton("➕ New Appointment", callback_data="cal:new")],
             [InlineKeyboardButton("Today", callback_data="cal:today"),
              InlineKeyboardButton("Tomorrow", callback_data="cal:tomorrow")],
             [InlineKeyboardButton("This Week", callback_data="cal:week")],
@@ -264,7 +265,16 @@ async def calendar_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     action = query.data.split(":", 1)[1] if ":" in query.data else query.data
     today = datetime.now(ZoneInfo(settings.timezone)).date()
 
-    if action == "today":
+    if action == "new":
+        if not settings.calendar_configured:
+            await query.message.reply_text("Calendar isn't set up yet — see the README to connect it.")
+            return
+        await query.message.reply_text(
+            "Tell me what to schedule, in plain language — e.g. \"Meeting with John Tan "
+            "tomorrow 3-4pm\" or \"Client call next Tuesday at 10am\" — and I'll add it to "
+            "your calendar."
+        )
+    elif action == "today":
         await _reply_events_for_range(
             query.message, today.isoformat(), today.isoformat(),
             "*Today's schedule*", "Nothing on your calendar today.",
@@ -304,7 +314,9 @@ async def calendar_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 
 async def _menu_calendar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text("What would you like to check?", reply_markup=calendar_inline_keyboard())
+    await update.message.reply_text(
+        "What would you like to do?", reply_markup=calendar_inline_keyboard()
+    )
 
 
 async def _menu_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
