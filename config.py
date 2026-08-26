@@ -34,10 +34,13 @@ class Settings:
     anthropic_model: str
     timezone: str
     default_currency: str
+    agent_name: str
+    extraction_model: str
 
     google_service_account_info: Optional[dict]
     google_calendar_id: Optional[str]
     google_sheet_id: Optional[str]
+    policy_pdf_storage_dir: Optional[str]
 
     @property
     def calendar_configured(self) -> bool:
@@ -92,6 +95,7 @@ def load_settings() -> Settings:
 
     calendar_id = os.environ.get("GOOGLE_CALENDAR_ID", "").strip() or None
     sheet_id = os.environ.get("GOOGLE_SHEET_ID", "").strip() or None
+    policy_pdf_storage_dir = os.environ.get("POLICY_PDF_STORAGE_DIR", "").strip() or None
 
     settings = Settings(
         telegram_bot_token=os.environ["TELEGRAM_BOT_TOKEN"],
@@ -100,9 +104,12 @@ def load_settings() -> Settings:
         anthropic_model=os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-5"),
         timezone=os.environ.get("TIMEZONE", "Asia/Singapore"),
         default_currency=os.environ.get("DEFAULT_CURRENCY", "SGD"),
+        agent_name=os.environ.get("AGENT_NAME", "Nicholas"),
+        extraction_model=os.environ.get("EXTRACTION_MODEL", "claude-haiku-4-5-20251001"),
         google_service_account_info=service_account_info,
         google_calendar_id=calendar_id,
         google_sheet_id=sheet_id,
+        policy_pdf_storage_dir=policy_pdf_storage_dir,
     )
 
     if not settings.calendar_configured:
@@ -116,6 +123,10 @@ def load_settings() -> Settings:
             "Google Sheets is not fully configured (need GOOGLE_SERVICE_ACCOUNT_JSON/"
             "FILE and GOOGLE_SHEET_ID) — receipt logging will reply with an "
             "explanation instead of working."
+        )
+    if not settings.policy_pdf_storage_dir:
+        logger.warning(
+            "POLICY_PDF_STORAGE_DIR is not set — original policy PDFs will not be archived."
         )
 
     return settings

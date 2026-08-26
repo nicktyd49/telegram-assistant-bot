@@ -232,13 +232,16 @@ async def run_conversation(history: list[dict]) -> str:
     tools = _build_tools()
 
     for _ in range(MAX_TOOL_ITERATIONS):
-        response = await anthropic_client.messages.create(
+        create_kwargs = dict(
             model=settings.anthropic_model,
             max_tokens=1024,
             system=build_system_prompt(),
             messages=history,
-            tools=tools if tools else None,
         )
+        if tools:
+            create_kwargs["tools"] = tools
+
+        response = await anthropic_client.messages.create(**create_kwargs)
 
         history.append({"role": "assistant", "content": response.content})
 
