@@ -26,6 +26,7 @@ logger = logging.getLogger("assistant-bot.sheets")
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 SHEET_TAB = "Receipts"
 HEADER_ROW = ["Date", "Vendor", "Amount", "Currency", "Category", "Notes", "Logged At"]
+ROW_KEYS = ["date", "vendor", "amount", "currency", "category", "notes", "logged_at"]
 
 _service = None
 _header_checked = False
@@ -33,6 +34,11 @@ _header_checked = False
 
 class SheetsNotConfigured(RuntimeError):
     pass
+
+
+class NoReceiptToUndo(RuntimeError):
+    """Raised when /undo is used but the Receipts tab has no logged rows
+    (just the header, or nothing at all) — nothing to remove."""
 
 
 def _get_service():
@@ -106,4 +112,84 @@ async def append_receipt(date: str, vendor: str, amount: float, currency: str = 
         await asyncio.to_thread(_append_receipt_sync, date, vendor, amount, currency, category, notes)
     except HttpError as exc:
         logger.exception("Sheets append_receipt failed")
+        raise RuntimeError(f"Google Sheets rejected the request: {exc.reason}") from exc
+
+
+def _receipts_tab_id_sync(service, sheet_id: str) -> int:
+    meta = service.spreadsheets().get(spreadsheetId=sheet_id).execute()
+    for s in meta.get("sheets", []):
+        if s["properties"]["title"] == SHEET_TAB:
+            return s["properties"]["sheetId"]
+    raise NoReceiptToUndo("There's no Receipts tab yet — nothing's been logged.")
+
+
+def _last_receipt_row_sync(service, sheet_id: str) -> Optional[int]:
+    """1-indexed row number of the most recently logged receipt (the last
+    row with data in column A), or None if there's nothing past the header
+    row yet."""
+    values = (
+        service.spreadsheets()
+        .values()
+        .get(spreadsheetId=sheet_id, range=f"{SHEET_TAB}!A:A")
+        .execute()
+        .get("values", [])
+    )
+    last_row = len(values)
+    return last_row if last_row > 1 else None  # row 1 is the header
+
+
+def _delete_last_receipt_sync() -> dict:
+    _ensure_header_sync()
+    service = _get_service()
+    sheet_id = settings.google_sheet_id
+
+    last_row = _last_receipt_row_sync(service, sheet_id)
+    if last_row is None:
+        raise NoReceiptToUndo("There's no logged receipt to undo.")
+
+    # Read the row before deleting it, so the caller can confirm to the user
+    # exactly what was removed.
+    row_values = (
+        service.spreadsheets()
+        .values()
+        .get(spreadsheetId=sheet_id, range=f"{SHEET_TAB}!A{last_row}:G{last_row}")
+        .execute()
+        .get("values", [[]])
+    )
+    row_values = row_values[0] if row_values else []
+    removed = dict(zip(ROW_KEYS, row_values + [""] * (len(ROW_KEYS) - len(row_values))))
+
+    tab_id = _receipts_tab_id_sync(service, sheet_id)
+    service.spreadsheets().batchUpdate(
+        spreadsheetId=sheet_id,
+        body={
+            "requests": [
+                {
+                    "deleteDimension": {
+                        "range": {
+                            "sheetId": tab_id,
+                            "dimension": "ROWS",
+                            "startIndex": last_row - 1,  # deleteDimension is 0-indexed
+                            "endIndex": last_row,
+                        }
+                    }
+                }
+            ]
+        },
+    ).execute()
+
+    return removed
+
+
+async def delete_last_receipt() -> dict:
+    """Deletes the most recently logged receipt row and returns what was
+    removed (date/vendor/amount/etc.) so the caller can tell the user
+    exactly what got undone. Raises NoReceiptToUndo if the Receipts tab is
+    empty (nothing logged yet)."""
+    try:
+        return await asyncio.to_thread(_delete_last_receipt_sync)
+    except NoReceiptToUndo:
+        raise
+    except HttpError as exc:
+        logger.exception("Sheets delete_last_receipt failed")
         raise RuntimeError(f"Google Sheets rejected the request: {exc.reason}") from exc

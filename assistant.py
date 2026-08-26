@@ -49,7 +49,9 @@ def build_system_prompt() -> str:
         capabilities.append(
             "- Logging business expense receipts the user *describes in text* to a "
             "spreadsheet via the log_receipt tool. (Receipts sent as photos are handled "
-            "automatically elsewhere — you won't see those as chat messages.)"
+            "automatically elsewhere — you won't see those as chat messages.) If the user "
+            "says the last receipt logged was wrong (wrong amount, a duplicate, etc.), use "
+            "the undo_last_receipt tool to remove it, then ask for the correct details."
         )
     else:
         capabilities.append(
@@ -157,6 +159,18 @@ def _build_tools() -> list[dict]:
                 },
             }
         )
+        tools.append(
+            {
+                "name": "undo_last_receipt",
+                "description": (
+                    "Remove the most recently logged receipt (whichever came in most recently, "
+                    "whether via photo, PDF, or chat text) - use this when the user says the "
+                    "last one was wrong, a duplicate, or a misread. Only removes ONE row - the "
+                    "latest. There's no way to undo further back than that."
+                ),
+                "input_schema": {"type": "object", "properties": {}},
+            }
+        )
     return tools
 
 
@@ -218,6 +232,13 @@ async def _dispatch_tool(name: str, tool_input: dict) -> tuple[str, bool]:
                 notes=tool_input.get("notes"),
             )
             return json.dumps({"status": "logged"}), False
+
+        if name == "undo_last_receipt":
+            try:
+                removed = await sheets_service.delete_last_receipt()
+            except sheets_service.NoReceiptToUndo as exc:
+                return json.dumps({"status": "nothing_to_undo", "message": str(exc)}), False
+            return json.dumps({"status": "removed", "removed": removed}), False
 
         return json.dumps({"error": f"Unknown tool '{name}'"}), True
 

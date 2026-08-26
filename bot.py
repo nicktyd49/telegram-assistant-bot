@@ -128,6 +128,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             " and I'll update your Google Calendar." if settings.calendar_configured else " — not set up yet."
         ),
         "- /today — today's schedule",
+        "- /undo — remove the most recently logged receipt (in case of a misread)",
         "- /menu — show the tap-to-use buttons again",
         "- /start — reset our conversation",
         "",
@@ -224,6 +225,32 @@ async def today_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     today = datetime.now(ZoneInfo(settings.timezone)).strftime("%Y-%m-%d")
     await _reply_events_for_range(
         update.message, today, today, "*Today's schedule*", "Nothing on your calendar today."
+    )
+
+
+async def undo_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Removes the most recently logged receipt row (whether it came in via
+    photo, PDF, or chat text) - the fix for a misread that already got
+    saved, without needing to open the spreadsheet by hand."""
+    if not _is_allowed(update):
+        return
+    try:
+        removed = await sheets_service.delete_last_receipt()
+    except sheets_service.NoReceiptToUndo:
+        await update.message.reply_text("There's nothing to undo — no receipts logged yet.")
+        return
+    except sheets_service.SheetsNotConfigured:
+        await update.message.reply_text("Receipt logging isn't set up yet, so there's nothing to undo.")
+        return
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Failed to undo last receipt")
+        await update.message.reply_text(f"Couldn't undo that: {exc}")
+        return
+
+    category_suffix = f" ({removed['category']})" if removed.get("category") else ""
+    await update.message.reply_text(
+        f"Removed: {removed['vendor']}, {removed['currency']} {removed['amount']}, "
+        f"{removed['date']}{category_suffix}\n\nSend the correct details and I'll log it fresh."
     )
 
 
@@ -688,6 +715,7 @@ def main() -> None:
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("today", today_command))
+    app.add_handler(CommandHandler("undo", undo_command))
     app.add_handler(CommandHandler("menu", menu_command))
     app.add_handler(CallbackQueryHandler(calendar_callback, pattern=r"^cal:"))
     app.add_handler(CallbackQueryHandler(policy_client_callback, pattern=r"^polc:"))
