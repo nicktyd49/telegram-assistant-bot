@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import logging
 import re
 from datetime import datetime, timedelta, date, time as dt_time
+from io import BytesIO
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -21,7 +23,7 @@ from telegram.ext import (
 
 from config import settings
 from assistant import anthropic_client, run_conversation
-from services import calendar_service, sheets_service, pdf_utils, policy_workbook, policy_illustration
+from services import calendar_service, sheets_service, pdf_utils, policy_workbook, policy_illustration, onedrive_service
 from prompts import POLICY_SUMMARY_PROMPT, RECEIPT_EXTRACTION_PROMPT, POLICY_FIELDS_EXTRACTION_PROMPT
 
 MAX_HISTORY_MESSAGES = 40
@@ -130,6 +132,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         ),
         "- /today — today's schedule",
         "- /undo — remove the most recently logged receipt (in case of a misread)",
+        "- /onedrive_setup — connect OneDrive so client files and archived PDFs are backed up" + (
+            " (already connected)" if settings.onedrive_token_cache else ""
+        ),
         "- /menu — show the tap-to-use buttons again",
         "- /start — reset our conversation",
         "",
@@ -252,6 +257,56 @@ async def undo_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await update.message.reply_text(
         f"Removed: {removed['vendor']}, {removed['currency']} {removed['amount']}, "
         f"{removed['date']}{category_suffix}\n\nSend the correct details and I'll log it fresh."
+    )
+
+
+async def onedrive_setup_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Runs Microsoft's OAuth device-code flow live (this has to happen on
+    Railway — see services/onedrive_service.py for why), walks Nic through
+    signing in from his phone/laptop browser, then hands back the resulting
+    token cache to paste into Railway as ONEDRIVE_TOKEN_CACHE. After that,
+    client workbooks and archived policy PDFs sync to OneDrive automatically
+    on every policy summary."""
+    if not _is_allowed(update):
+        return
+    if not settings.onedrive_client_id:
+        await update.message.reply_text(
+            "OneDrive isn't set up yet — ONEDRIVE_CLIENT_ID needs to be added to Railway first."
+        )
+        return
+
+    try:
+        flow = await asyncio.to_thread(onedrive_service.start_device_flow)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Failed to start OneDrive device flow")
+        await update.message.reply_text(f"Couldn't start OneDrive sign-in: {exc}")
+        return
+
+    await update.message.reply_text(
+        "To connect OneDrive:\n\n"
+        f"1. Open {flow['verification_uri']}\n"
+        f"2. Enter this code: `{flow['user_code']}`\n"
+        "3. Sign in with your Microsoft account and approve access.\n\n"
+        "I'll message you again once you're done (you have about 15 minutes).",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+    try:
+        cache_str = await asyncio.to_thread(onedrive_service.complete_device_flow, flow)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("OneDrive device flow did not complete")
+        await update.message.reply_text(f"OneDrive sign-in didn't complete: {exc}")
+        return
+
+    await update.message.reply_text(
+        "You're signed in! Last step — open the file below, copy everything in it, and paste "
+        "it as the ONEDRIVE_TOKEN_CACHE variable in Railway (Variables tab → New Variable). "
+        "Railway will redeploy automatically and OneDrive syncing will be live — no need to "
+        "run this again unless I tell you OneDrive's connection expired."
+    )
+    cache_bytes = cache_str.encode("utf-8")
+    await update.message.reply_document(
+        document=BytesIO(cache_bytes), filename="onedrive_token_cache.txt"
     )
 
 
@@ -583,20 +638,31 @@ def _safe_component(text: str | None, fallback: str) -> str:
     return cleaned or fallback
 
 
-def _save_original_pdf(client_name: str, filename: str | None, pdf_bytes: bytes) -> None:
-    """Archives the original policy PDF under the client's own subfolder in
-    the configured storage location (e.g. a OneDrive-synced folder), so the
-    agent can pull up the source document later without hunting through
-    Telegram history. No-op if no storage location is configured."""
+async def _save_original_pdf(client_name: str, filename: str | None, pdf_bytes: bytes) -> None:
+    """Archives the original policy PDF so the agent can pull up the source
+    document later without hunting through Telegram history. When OneDrive
+    is configured, this uploads there (the durable copy — survives a
+    redeploy). Otherwise it falls back to POLICY_PDF_STORAGE_DIR, a local
+    path — handy for local dev, but on Railway that disk is wiped on every
+    redeploy, so this path is only really a fallback. No-op if neither is
+    configured."""
+    stem = _safe_component(Path(filename).stem if filename else None, "policy")
+    timestamp = datetime.now(ZoneInfo(settings.timezone)).strftime("%Y%m%d_%H%M%S")
+    client_dir_name = _safe_component(client_name, "Unknown_Client")
+    dest_name = f"{stem}_{timestamp}.pdf"
+
+    if settings.onedrive_configured:
+        remote_path = f"Policy PDFs/{client_dir_name}/{dest_name}"
+        await onedrive_service.upload_bytes(remote_path, pdf_bytes)
+        logger.info("Archived original policy PDF to OneDrive: %s", remote_path)
+        return
+
     if not settings.policy_pdf_storage_dir:
         return
     base = Path(settings.policy_pdf_storage_dir).expanduser()
-    client_dir = base / _safe_component(client_name, "Unknown_Client")
+    client_dir = base / client_dir_name
     client_dir.mkdir(parents=True, exist_ok=True)
-
-    stem = _safe_component(Path(filename).stem if filename else None, "policy")
-    timestamp = datetime.now(ZoneInfo(settings.timezone)).strftime("%Y%m%d_%H%M%S")
-    dest = client_dir / f"{stem}_{timestamp}.pdf"
+    dest = client_dir / dest_name
     dest.write_bytes(pdf_bytes)
     logger.info("Archived original policy PDF to %s", dest)
 
@@ -606,7 +672,9 @@ async def _finish_policy_summary(
     pdf_bytes: bytes | None = None, pdf_filename: str | None = None,
 ) -> None:
     try:
-        xlsx_path, policy_count, gap_notes = policy_workbook.add_policy_row(client_name, fields)
+        xlsx_path, policy_count, gap_notes = await asyncio.to_thread(
+            policy_workbook.add_policy_row, client_name, fields
+        )
     except Exception as exc:  # noqa: BLE001
         logger.exception("Failed to update policy summary workbook")
         await message.reply_text(
@@ -615,7 +683,7 @@ async def _finish_policy_summary(
         return
 
     try:
-        policy_illustration.rebuild_illustration_sheet(client_name)
+        await asyncio.to_thread(policy_illustration.rebuild_illustration_sheet, client_name)
     except Exception:  # noqa: BLE001
         logger.exception("Failed to rebuild policy illustration sheet")
         # Non-fatal — the Policy Summary row is already saved; the illustration
@@ -623,7 +691,7 @@ async def _finish_policy_summary(
 
     if pdf_bytes is not None:
         try:
-            _save_original_pdf(client_name, pdf_filename, pdf_bytes)
+            await _save_original_pdf(client_name, pdf_filename, pdf_bytes)
         except Exception:  # noqa: BLE001
             logger.exception("Failed to archive original policy PDF")
             # Non-fatal — same reasoning as the illustration sheet above.
@@ -728,6 +796,7 @@ def main() -> None:
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("today", today_command))
     app.add_handler(CommandHandler("undo", undo_command))
+    app.add_handler(CommandHandler("onedrive_setup", onedrive_setup_command))
     app.add_handler(CommandHandler("menu", menu_command))
     app.add_handler(CallbackQueryHandler(calendar_callback, pattern=r"^cal:"))
     app.add_handler(CallbackQueryHandler(policy_client_callback, pattern=r"^polc:"))

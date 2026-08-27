@@ -5,7 +5,7 @@ from datetime import date, datetime
 import openpyxl
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 
-from services.policy_workbook import PolicyWorkbookError, SHEET_NAME, _client_path
+from services.policy_workbook import PolicyWorkbookError, SHEET_NAME, _client_path, _sync_to_onedrive
 
 # This sheet is a big-picture protection-vs-savings snapshot, not a home for
 # every policy type. Only core life protection (Term/Whole Life) goes in the
@@ -543,4 +543,5 @@ def rebuild_illustration_sheet(client_name: str):
         )
 
     wb.save(path)
+    _sync_to_onedrive(path)
     return path

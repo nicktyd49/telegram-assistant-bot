@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import logging
 import math
 import re
 from datetime import date, datetime
@@ -11,9 +12,18 @@ from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.styles.colors import Color
 
 from config import settings
+from services import onedrive_service
+
+logger = logging.getLogger("assistant-bot.policy_workbook")
 
 CLIENT_DIR = Path(__file__).resolve().parent.parent / "client_policy_summaries"
 SHEET_NAME = "Policy Summary"
+
+# Where client workbooks live on OneDrive once ONEDRIVE_CLIENT_ID is set up —
+# this is the actual persistent copy; CLIENT_DIR above is just a working
+# cache on whatever disk the bot happens to be running on (which, on
+# Railway, gets wiped on every redeploy).
+ONEDRIVE_WORKBOOK_FOLDER = "Policy Summaries"
 
 HEADER_ROW = 4
 FIRST_DATA_ROW = 5
@@ -124,7 +134,51 @@ def _safe_filename(client_name: str) -> str:
 
 def _client_path(client_name: str) -> Path:
     CLIENT_DIR.mkdir(parents=True, exist_ok=True)
-    return CLIENT_DIR / _safe_filename(client_name)
+    path = CLIENT_DIR / _safe_filename(client_name)
+    _sync_from_onedrive(path)
+    return path
+
+
+def _onedrive_remote_path(path: Path) -> str:
+    return f"{ONEDRIVE_WORKBOOK_FOLDER}/{path.name}"
+
+
+def _sync_from_onedrive(path: Path) -> None:
+    """Pulls the latest saved copy of this client's workbook down from
+    OneDrive before we touch it locally, so we're always editing on top of
+    the real persisted version rather than whatever (possibly stale, or
+    wiped-by-redeploy) copy happens to be sitting on local disk. Silently
+    does nothing if OneDrive isn't configured yet, or if this client simply
+    doesn't have a workbook on OneDrive yet (a brand-new client)."""
+    if not settings.onedrive_configured:
+        return
+    try:
+        data = onedrive_service._download_bytes_sync(_onedrive_remote_path(path))
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "Could not check OneDrive for %s — continuing with whatever local copy is on disk",
+            path.name,
+        )
+        return
+    if data is not None:
+        path.write_bytes(data)
+
+
+def _sync_to_onedrive(path: Path) -> None:
+    """Pushes the just-saved local workbook up to OneDrive so it survives a
+    redeploy. Non-fatal if it fails — the caller already has a good local
+    copy to send back to Nic; it just won't be backed up until the next
+    successful save."""
+    if not settings.onedrive_configured:
+        return
+    try:
+        onedrive_service._upload_bytes_sync(_onedrive_remote_path(path), path.read_bytes())
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "Failed to sync %s to OneDrive — local copy is saved, but it won't survive a redeploy "
+            "until this succeeds",
+            path.name,
+        )
 
 
 def _to_number_or_text(value):
@@ -479,6 +533,7 @@ def add_policy_row(client_name: str, fields: dict, date_of_birth: str | None = N
     gap_notes = _coverage_gap_notes(ws, total_row, FIRST_DATA_ROW, last_row)
 
     wb.save(path)
+    _sync_to_onedrive(path)
     policy_count = sum(
         1 for r in range(FIRST_DATA_ROW, total_row)
         if ws.cell(row=r, column=2).value not in (None, "")

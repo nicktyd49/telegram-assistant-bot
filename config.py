@@ -42,6 +42,9 @@ class Settings:
     google_sheet_id: Optional[str]
     policy_pdf_storage_dir: Optional[str]
 
+    onedrive_client_id: Optional[str]
+    onedrive_token_cache: Optional[str]
+
     @property
     def calendar_configured(self) -> bool:
         return bool(self.google_service_account_info and self.google_calendar_id)
@@ -49,6 +52,14 @@ class Settings:
     @property
     def sheets_configured(self) -> bool:
         return bool(self.google_service_account_info and self.google_sheet_id)
+
+    @property
+    def onedrive_configured(self) -> bool:
+        """True once ONEDRIVE_CLIENT_ID is set — enough to run /onedrive_setup.
+        The token cache (ONEDRIVE_TOKEN_CACHE) is only needed for the actual
+        upload/download calls, which raise their own clear error if it's
+        missing/expired, so it isn't required here."""
+        return bool(self.onedrive_client_id)
 
 
 def _load_service_account_info() -> Optional[dict]:
@@ -96,6 +107,8 @@ def load_settings() -> Settings:
     calendar_id = os.environ.get("GOOGLE_CALENDAR_ID", "").strip() or None
     sheet_id = os.environ.get("GOOGLE_SHEET_ID", "").strip() or None
     policy_pdf_storage_dir = os.environ.get("POLICY_PDF_STORAGE_DIR", "").strip() or None
+    onedrive_client_id = os.environ.get("ONEDRIVE_CLIENT_ID", "").strip() or None
+    onedrive_token_cache = os.environ.get("ONEDRIVE_TOKEN_CACHE", "").strip() or None
 
     settings = Settings(
         telegram_bot_token=os.environ["TELEGRAM_BOT_TOKEN"],
@@ -110,6 +123,8 @@ def load_settings() -> Settings:
         google_calendar_id=calendar_id,
         google_sheet_id=sheet_id,
         policy_pdf_storage_dir=policy_pdf_storage_dir,
+        onedrive_client_id=onedrive_client_id,
+        onedrive_token_cache=onedrive_token_cache,
     )
 
     if not settings.calendar_configured:
@@ -127,6 +142,12 @@ def load_settings() -> Settings:
     if not settings.policy_pdf_storage_dir:
         logger.warning(
             "POLICY_PDF_STORAGE_DIR is not set — original policy PDFs will not be archived."
+        )
+    if not settings.onedrive_configured:
+        logger.warning(
+            "ONEDRIVE_CLIENT_ID is not set — client policy workbooks and archived PDFs "
+            "will only live on this server's disk and will be lost on the next deploy. "
+            "Run /onedrive_setup once ONEDRIVE_CLIENT_ID is added."
         )
 
     return settings
