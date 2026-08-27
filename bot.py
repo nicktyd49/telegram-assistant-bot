@@ -135,7 +135,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not _is_allowed(update):
         return
     lines = [
-        "*What I can do*",
+        "What I can do:",
         "- Send a policy PDF and I'll extract the details, log them to that client's policy "
         "summary spreadsheet, and send you back the updated file.",
         "- Send a photo of a receipt and I'll log it" + (
@@ -157,7 +157,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "Tip: caption a policy PDF with the client's name if I might not catch it correctly "
         "from the document, or caption it \"receipt\" if it's actually a receipt.",
     ]
-    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+    await update.message.reply_text("\n".join(lines))
 
 
 def _format_event_lines(events: list[dict]) -> list[str]:
