@@ -196,6 +196,78 @@ def _sync_to_onedrive(client_name: str, path: Path) -> None:
         )
 
 
+async def list_client_names() -> list[str]:
+    # All client folder names currently on OneDrive under Client/ - read from
+    # OneDrive directly (not the local cache in CLIENT_DIR) since that is the
+    # actual persisted list; local disk gets wiped on every Railway redeploy
+    # so it is not reliable as an index of "who are my clients".
+    if not settings.onedrive_configured:
+        return []
+    children = await onedrive_service.list_children(ONEDRIVE_WORKBOOK_FOLDER)
+    return sorted(c["name"] for c in children if "folder" in c)
+
+
+def _load_client_workbook(client_name: str):
+    # Read-only load of a client's existing workbook - unlike _open_or_create,
+    # this does NOT build a blank workbook when one does not exist yet; a
+    # lookup command has nothing useful to show for a client with no policies
+    # logged, so it should say so rather than showing an empty sheet.
+    path = _client_path(client_name)
+    if not path.exists():
+        raise PolicyWorkbookError(f"No policy summary found yet for {client_name}.")
+    wb = openpyxl.load_workbook(path, data_only=True)
+    if SHEET_NAME not in wb.sheetnames:
+        raise PolicyWorkbookError(f"Workbook is missing a '{SHEET_NAME}' sheet")
+    return wb
+
+
+def get_client_summary(client_name: str) -> dict:
+    # Everything worth showing about a client in a quick chat lookup: their
+    # policies (one dict per row), the totals row, and the same coverage-gap
+    # notes add_policy_row already computes on every save.
+    wb = _load_client_workbook(client_name)
+    ws = wb[SHEET_NAME]
+    total_row = _find_total_row(ws)
+    last_row = total_row - 1
+
+    dob = ws["K3"].value
+    dob_display = _fmt_date_display(dob) if isinstance(dob, date) else (dob or None)
+
+    policies = []
+    for row in range(FIRST_DATA_ROW, total_row):
+        company = ws.cell(row=row, column=2).value  # B
+        if company in (None, ""):
+            continue
+        policies.append({
+            "company": company,
+            "policy_no": ws.cell(row=row, column=3).value,  # C
+            "payment_date": ws.cell(row=row, column=4).value,  # D
+            "plan_type": ws.cell(row=row, column=5).value,  # E
+            "premium_cash": ws.cell(row=row, column=6).value,  # F
+            "premium_cpf": ws.cell(row=row, column=7).value,  # G
+            "death_coverage": ws.cell(row=row, column=10).value,  # J
+            "ci_coverage": ws.cell(row=row, column=12).value,  # L
+            "remarks": ws.cell(row=row, column=17).value,  # Q
+        })
+
+    totals = {
+        "premium_cash": ws[f"F{total_row}"].value,
+        "premium_cpf": ws[f"G{total_row}"].value,
+        "death_coverage": ws[f"J{total_row}"].value,
+        "ci_coverage": ws[f"L{total_row}"].value,
+    }
+
+    gap_notes = _coverage_gap_notes(ws, total_row, FIRST_DATA_ROW, last_row)
+
+    return {
+        "client_name": client_name,
+        "date_of_birth": dob_display,
+        "policies": policies,
+        "totals": totals,
+        "gap_notes": gap_notes,
+    }
+
+
 def _to_number_or_text(value):
     """Most coverage/premium fields are plain numbers. Some investment-linked
     plans express a benefit as a formula instead of a fixed sum (e.g. "101% of

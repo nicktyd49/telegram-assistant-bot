@@ -131,6 +131,23 @@ def _download_bytes_sync(remote_path: str) -> Optional[bytes]:
     return resp.content
 
 
+def _list_children_sync(remote_folder: str) -> list[dict]:
+    # Lists the immediate children (files and subfolders) of remote_folder,
+    # e.g. 'Client'. Returns [] if the folder does not exist yet - nothing
+    # filed there so far, not an error.
+    url = f"{GRAPH_ROOT}/{quote(remote_folder, safe='/')}:/children"
+    resp = requests.get(url, headers=_graph_headers(), timeout=REQUEST_TIMEOUT)
+    if resp.status_code == 404:
+        return []
+    if resp.status_code >= 300:
+        raise RuntimeError(f"OneDrive listing failed ({resp.status_code}): {resp.text[:300]}")
+    return resp.json().get("value", [])
+
+
+async def list_children(remote_folder: str) -> list[dict]:
+    return await asyncio.to_thread(_list_children_sync, remote_folder)
+
+
 async def upload_bytes(remote_path: str, data: bytes) -> None:
     await asyncio.to_thread(_upload_bytes_sync, remote_path, data)
 

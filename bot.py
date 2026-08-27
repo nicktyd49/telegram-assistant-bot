@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import difflib
 import json
 import logging
 import re
@@ -148,6 +149,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         ),
         "- /today — today's schedule",
         "- /undo — remove the most recently logged receipt (in case of a misread)",
+        "- /client <name> — pull up a client policy summary in chat (numbers, coverage, gap notes)",
         "- /onedrive_setup — connect OneDrive so client files and archived PDFs are backed up" + (
             " (already connected)" if settings.onedrive_token_cache else ""
         ),
@@ -276,6 +278,124 @@ async def undo_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         f"Removed: {removed['vendor']}, {removed['currency']} {removed['amount']}, "
         f"{removed['date']}{category_suffix}\n\nSend the correct details and I'll log it fresh."
     )
+
+
+def _fmt_money(value, decimals: int = 2):
+    if value in (None, ""):
+        return None
+    if isinstance(value, (int, float)):
+        return f"${value:,.{decimals}f}"
+    return str(value)
+
+
+def _format_client_summary(summary: dict) -> str:
+    lines = [summary["client_name"]]
+    if summary.get("date_of_birth"):
+        lines.append(f"DOB: {summary['date_of_birth']}")
+
+    policies = summary.get("policies") or []
+    if not policies:
+        lines.append("")
+        lines.append("No policies logged yet.")
+        return "\n".join(lines)
+
+    lines.append("")
+    lines.append(f"{len(policies)} polic{'y' if len(policies) == 1 else 'ies'}:")
+    for p in policies:
+        company = p.get("company") or "?"
+        plan = p.get("plan_type") or "Plan"
+        lines.append(f"\n• {company} — {plan}")
+        if p.get("policy_no"):
+            lines.append(f"  {p['policy_no']}")
+        if p.get("payment_date"):
+            lines.append(f"  {p['payment_date']}")
+        premium_cash = _fmt_money(p.get("premium_cash"))
+        premium_cpf = _fmt_money(p.get("premium_cpf"))
+        premium_bits = [f"{v} cash" if k == "cash" else f"{v} CPF"
+                         for k, v in (("cash", premium_cash), ("cpf", premium_cpf)) if v]
+        if premium_bits:
+            lines.append(f"  Premium: {' + '.join(premium_bits)}/yr")
+        death_cov = _fmt_money(p.get("death_coverage"), 0)
+        ci_cov = _fmt_money(p.get("ci_coverage"), 0)
+        coverage_bits = [f"Death {death_cov}" if death_cov else None, f"CI {ci_cov}" if ci_cov else None]
+        coverage_bits = [b for b in coverage_bits if b]
+        if coverage_bits:
+            lines.append(f"  Coverage: {', '.join(coverage_bits)}")
+        if p.get("remarks"):
+            lines.append(f"  Note: {p['remarks']}")
+
+    totals = summary.get("totals") or {}
+    total_cash = _fmt_money(totals.get("premium_cash"))
+    total_cpf = _fmt_money(totals.get("premium_cpf"))
+    total_bits = [f"{v} cash" if k == "cash" else f"{v} CPF"
+                   for k, v in (("cash", total_cash), ("cpf", total_cpf)) if v]
+    if total_bits:
+        lines.append(f"\nTotal annual premium: {' + '.join(total_bits)}")
+
+    if summary.get("gap_notes"):
+        lines.append("\n⚠️ Coverage notes:")
+        for note in summary["gap_notes"]:
+            lines.append(f"- {note}")
+
+    return "\n".join(lines)
+
+
+async def client_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # /client <name> - pulls up a client's policy summary numbers straight in
+    # chat, so Nic does not need to open OneDrive/Excel on his phone mid-call
+    # just to answer "what's my coverage again".
+    if not _is_allowed(update):
+        return
+    if not settings.onedrive_configured:
+        await update.message.reply_text(
+            "OneDrive isn't connected yet, so I can't look up client files — run /onedrive_setup first."
+        )
+        return
+
+    try:
+        all_clients = await policy_workbook.list_client_names()
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Failed to list clients from OneDrive")
+        await update.message.reply_text(f"Couldn't reach OneDrive to look up clients: {exc}")
+        return
+
+    query = " ".join(context.args).strip() if context.args else ""
+    if not query:
+        if not all_clients:
+            await update.message.reply_text("No client folders found on OneDrive yet.")
+            return
+        await update.message.reply_text(
+            "Usage: /client <name>\n\nClients on file:\n" + "\n".join(f"- {c}" for c in all_clients)
+        )
+        return
+
+    query_lower = query.lower()
+    matches = [c for c in all_clients if query_lower in c.lower()]
+    if not matches:
+        suggestions = difflib.get_close_matches(query, all_clients, n=3)
+        msg = f'No client found matching "{query}".'
+        if suggestions:
+            msg += "\n\nDid you mean:\n" + "\n".join(f"- {s}" for s in suggestions)
+        await update.message.reply_text(msg)
+        return
+    if len(matches) > 1:
+        await update.message.reply_text(
+            "That matches more than one client — which one?\n\n" + "\n".join(f"- {m}" for m in matches)
+        )
+        return
+
+    client_name = matches[0]
+    try:
+        summary = await asyncio.to_thread(policy_workbook.get_client_summary, client_name)
+    except policy_workbook.PolicyWorkbookError as exc:
+        await update.message.reply_text(str(exc))
+        return
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Failed to load client summary for %s", client_name)
+        await update.message.reply_text(f"Couldn't load {client_name}'s policy summary: {exc}")
+        return
+
+    await update.message.reply_text(_format_client_summary(summary))
 
 
 async def onedrive_setup_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1053,6 +1173,7 @@ def main() -> None:
     app.add_handler(CommandHandler("today", today_command))
     app.add_handler(CommandHandler("undo", undo_command))
     app.add_handler(CommandHandler("onedrive_setup", onedrive_setup_command))
+    app.add_handler(CommandHandler("client", client_command))
     app.add_handler(CommandHandler("menu", menu_command))
     app.add_handler(CallbackQueryHandler(calendar_callback, pattern=r"^cal:"))
     app.add_handler(CallbackQueryHandler(policy_client_callback, pattern=r"^polc:"))
