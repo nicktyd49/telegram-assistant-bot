@@ -23,7 +23,7 @@ SHEET_NAME = "Policy Summary"
 # this is the actual persistent copy; CLIENT_DIR above is just a working
 # cache on whatever disk the bot happens to be running on (which, on
 # Railway, gets wiped on every redeploy).
-ONEDRIVE_WORKBOOK_FOLDER = "Policy Summaries"
+ONEDRIVE_WORKBOOK_FOLDER = "Client"
 
 HEADER_ROW = 4
 FIRST_DATA_ROW = 5
