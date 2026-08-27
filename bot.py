@@ -5,6 +5,7 @@ import base64
 import json
 import logging
 import re
+import traceback
 from datetime import datetime, timedelta, date, time as dt_time
 from io import BytesIO
 from pathlib import Path
@@ -948,8 +949,34 @@ async def _extract_and_log_receipt_from_text(update: Update, text: str) -> None:
     await _log_parsed_receipt(update, data)
 
 
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Catches any exception a handler raises that would otherwise just get
+    logged and silently swallowed (this is how the /help crash and the
+    illustration-sheet OneDrive sync bug both went unnoticed until someone
+    happened to check Railway's logs) — logs it properly AND pings Nic
+    directly in Telegram so a broken feature doesn't sit silently broken."""
+    logger.error("Unhandled exception while processing an update", exc_info=context.error)
+    try:
+        trace = "".join(
+            traceback.format_exception(type(context.error), context.error, context.error.__traceback__)
+        )
+    except Exception:  # noqa: BLE001
+        trace = str(context.error)
+    last_line = next((ln for ln in reversed(trace.strip().splitlines())), str(context.error))
+    try:
+        await context.bot.send_message(
+            chat_id=settings.allowed_user_id,
+            text=f"\u26a0\ufe0f Something broke behind the scenes: {last_line}\n\n"
+            "Whatever you just did probably didn't go through. Check Railway logs for the "
+            "full details if it keeps happening.",
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("Failed to notify about the above error")
+
+
 def main() -> None:
     app = Application.builder().token(settings.telegram_bot_token).build()
+    app.add_error_handler(error_handler)
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("today", today_command))
