@@ -38,6 +38,7 @@ WORK_END_HOUR = 21
 MENU_CALENDAR = "📅 Calendar"
 MENU_RECEIPT = "🧾 Log Receipt"
 MENU_POLICY = "📄 Policy Summary"
+MENU_FILE = "🗂 File Client Items"
 MENU_HELP = "❓ Help"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -49,6 +50,13 @@ conversations: dict[int, list[dict]] = {}
 # In-memory per-chat "waiting for client name" state for policy PDFs where we
 # couldn't figure out who the policy belongs to. Maps chat_id -> extracted fields.
 pending_policy: dict[int, dict] = {}
+
+# In-memory per-chat "File Client Items" session state. Maps chat_id -> {
+# "client_name": str | None, "count": int }. client_name is None while we're
+# still waiting on the name; once set, any document/photo that arrives is
+# saved straight to that client's OneDrive folder (no extraction, just a
+# plain file drop) until the session is closed via the Done button.
+pending_client_files: dict[int, dict] = {}
 
 
 def _trim_history(history: list[dict]) -> None:
@@ -73,7 +81,7 @@ def _is_allowed(update: Update) -> bool:
 def main_menu_keyboard() -> ReplyKeyboardMarkup:
     """The persistent row of buttons at the bottom of the chat."""
     return ReplyKeyboardMarkup(
-        [[MENU_CALENDAR, MENU_RECEIPT], [MENU_POLICY, MENU_HELP]],
+        [[MENU_CALENDAR, MENU_RECEIPT], [MENU_POLICY, MENU_FILE], [MENU_HELP]],
         resize_keyboard=True,
     )
 
@@ -92,11 +100,17 @@ def calendar_inline_keyboard() -> InlineKeyboardMarkup:
     )
 
 
+def _done_filing_keyboard() -> InlineKeyboardMarkup:
+    """Shown while a 'File Client Items' session is active."""
+    return InlineKeyboardMarkup([[InlineKeyboardButton("✅ Done Filing", callback_data="filedone")]])
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_allowed(update):
         return
     conversations[update.effective_chat.id] = []
     pending_policy.pop(update.effective_chat.id, None)
+    pending_client_files.pop(update.effective_chat.id, None)
     await update.message.reply_text(
         "Hi! I'm your personal assistant. I can:\n"
         "- Chat, draft client messages, and answer questions\n"
@@ -135,6 +149,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "- /onedrive_setup — connect OneDrive so client files and archived PDFs are backed up" + (
             " (already connected)" if settings.onedrive_token_cache else ""
         ),
+        "- 🗂 File Client Items (button below) — just save any file(s) for a client to OneDrive, "
+        "no extraction, no spreadsheet — for anything that isn't a policy PDF or a receipt.",
         "- /menu — show the tap-to-use buttons again",
         "- /start — reset our conversation",
         "",
@@ -386,12 +402,23 @@ async def _menu_policy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
 
 
+async def _menu_file_client_items(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Starts a 'just save this to OneDrive' session — no extraction, any
+    file type. Asks for the client name first, then collects files until the
+    Done button is tapped."""
+    chat_id = update.effective_chat.id
+    pending_policy.pop(chat_id, None)
+    pending_client_files[chat_id] = {"client_name": None, "count": 0}
+    await update.message.reply_text("Who are these files for? Send me the client's name.")
+
+
 # Persistent-keyboard button text -> handler. Checked first in handle_message
 # so tapping a button doesn't fall through to the general chat assistant.
 MENU_ACTIONS = {
     MENU_CALENDAR: _menu_calendar,
     MENU_RECEIPT: _menu_receipt,
     MENU_POLICY: _menu_policy,
+    MENU_FILE: _menu_file_client_items,
     MENU_HELP: help_command,
 }
 
@@ -432,6 +459,33 @@ async def policy_client_callback(update: Update, context: ContextTypes.DEFAULT_T
     )
 
 
+async def _close_filing_session(update: Update, chat_id: int, edit: bool = False) -> None:
+    state = pending_client_files.pop(chat_id, None)
+    if not state or not state.get("client_name"):
+        msg = "Nothing to finish — no filing session is active."
+    else:
+        count = state.get("count", 0)
+        name = state["client_name"]
+        msg = (
+            f"No files were sent for {name}, so nothing was filed."
+            if count == 0
+            else f"Done — filed {count} file(s) under {name} in OneDrive."
+        )
+    if edit and update.callback_query:
+        await update.callback_query.edit_message_text(msg)
+    else:
+        await update.message.reply_text(msg, reply_markup=main_menu_keyboard())
+
+
+async def file_done_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not _is_allowed(update):
+        await query.answer()
+        return
+    await query.answer()
+    await _close_filing_session(update, update.effective_chat.id, edit=True)
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_allowed(update):
         return
@@ -441,6 +495,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     if text_raw in MENU_ACTIONS:
         pending_policy.pop(chat_id, None)
+        if text_raw != MENU_FILE:
+            pending_client_files.pop(chat_id, None)
         await MENU_ACTIONS[text_raw](update, context)
         return
 
@@ -454,6 +510,30 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await _finish_policy_summary(
             update.message, client_name, pending["fields"],
             pdf_bytes=pending.get("pdf_bytes"), pdf_filename=pending.get("pdf_filename"),
+        )
+        return
+
+    if chat_id in pending_client_files:
+        state = pending_client_files[chat_id]
+        if state["client_name"] is None:
+            name = text_raw.strip()
+            if not name:
+                await update.message.reply_text("I still need a name — who are these files for?")
+                return
+            state["client_name"] = name
+            await update.message.reply_text(
+                f"Got it — filing under {name}. Send me the files now (any type — documents, "
+                "photos, whatever). Tap ✅ Done Filing below when you're finished.",
+                reply_markup=_done_filing_keyboard(),
+            )
+            return
+        if text_raw.strip().lower() in {"done", "finish"}:
+            await _close_filing_session(update, chat_id)
+            return
+        await update.message.reply_text(
+            f"Still filing under {state['client_name']} ({state.get('count', 0)} file(s) so far). "
+            "Send more files, or tap ✅ Done Filing to finish.",
+            reply_markup=_done_filing_keyboard(),
         )
         return
 
@@ -479,13 +559,19 @@ async def handle_policy_or_receipt_pdf(update: Update, context: ContextTypes.DEF
     if not _is_allowed(update):
         return
 
-    caption_raw = (update.message.caption or "").strip()
-    caption = caption_raw.lower()
+    chat_id = update.effective_chat.id
     document = update.message.document
 
     await update.message.chat.send_action("typing")
     tg_file = await context.bot.get_file(document.file_id)
     pdf_bytes = bytes(await tg_file.download_as_bytearray())
+
+    if chat_id in pending_client_files and pending_client_files[chat_id].get("client_name"):
+        await _file_client_item(update, chat_id, pdf_bytes, document.file_name)
+        return
+
+    caption_raw = (update.message.caption or "").strip()
+    caption = caption_raw.lower()
 
     text = pdf_utils.extract_text(pdf_bytes)
     if not text:
@@ -513,18 +599,47 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not _is_allowed(update):
         return
 
-    caption = (update.message.caption or "").lower()
+    chat_id = update.effective_chat.id
     photo = update.message.photo[-1]  # largest size
 
     await update.message.chat.send_action("typing")
     tg_file = await context.bot.get_file(photo.file_id)
     image_bytes = bytes(await tg_file.download_as_bytearray())
+
+    if chat_id in pending_client_files and pending_client_files[chat_id].get("client_name"):
+        await _file_client_item(update, chat_id, image_bytes, f"{photo.file_unique_id}.jpg")
+        return
+
+    caption = (update.message.caption or "").lower()
     image_b64 = base64.b64encode(image_bytes).decode("ascii")
 
     if "policy" in caption:
         await _summarize_policy_from_image(update, image_b64)
     else:
         await _extract_and_log_receipt_from_image(update, image_b64)
+
+
+async def handle_generic_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Any document that isn't a PDF (Word docs, images-as-file, zips, etc).
+    Outside a 'File Client Items' session there's nothing useful to do with
+    these, so we just point Nic at that button."""
+    if not _is_allowed(update):
+        return
+
+    chat_id = update.effective_chat.id
+    document = update.message.document
+
+    if chat_id in pending_client_files and pending_client_files[chat_id].get("client_name"):
+        await update.message.chat.send_action("typing")
+        tg_file = await context.bot.get_file(document.file_id)
+        file_bytes = bytes(await tg_file.download_as_bytearray())
+        await _file_client_item(update, chat_id, file_bytes, document.file_name)
+        return
+
+    await update.message.reply_text(
+        "I can only read PDFs and photos for policy/receipt logging. To just save a file for a "
+        "client, tap 🗂 File Client Items first."
+    )
 
 
 async def _summarize_policy_from_image(update: Update, image_b64: str) -> None:
@@ -636,6 +751,43 @@ async def _extract_and_fill_policy_summary(
 def _safe_component(text: str | None, fallback: str) -> str:
     cleaned = re.sub(r"[^A-Za-z0-9]+", "_", (text or "").strip()).strip("_")
     return cleaned or fallback
+
+
+async def _file_client_item(update: Update, chat_id: int, file_bytes: bytes, suggested_filename: str | None) -> None:
+    """Uploads one file straight to OneDrive under the active 'File Client
+    Items' session's client folder — no extraction, just a plain archive
+    drop. Only called when pending_client_files[chat_id] already has a
+    client_name set."""
+    state = pending_client_files[chat_id]
+    client_name = state["client_name"]
+
+    if not settings.onedrive_configured:
+        pending_client_files.pop(chat_id, None)
+        await update.message.reply_text(
+            "OneDrive isn't connected yet, so I can't file this — run /onedrive_setup first, "
+            "then start over with 🗂 File Client Items."
+        )
+        return
+
+    timestamp = datetime.now(ZoneInfo(settings.timezone)).strftime("%Y%m%d_%H%M%S")
+    safe_client = _safe_component(client_name, "Unknown_Client")
+    suffix = Path(suggested_filename).suffix if suggested_filename else ""
+    stem = _safe_component(Path(suggested_filename).stem if suggested_filename else None, "file")
+    remote_path = f"Client Files/{safe_client}/{stem}_{timestamp}{suffix}"
+
+    try:
+        await onedrive_service.upload_bytes(remote_path, file_bytes)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Failed to file client item to OneDrive")
+        await update.message.reply_text(f"Couldn't save that file to OneDrive: {exc}")
+        return
+
+    state["count"] = state.get("count", 0) + 1
+    logger.info("Filed client item to OneDrive: %s", remote_path)
+    await update.message.reply_text(
+        f"Saved ({state['count']} so far for {client_name}). Send more, or tap ✅ Done Filing.",
+        reply_markup=_done_filing_keyboard(),
+    )
 
 
 async def _save_original_pdf(client_name: str, filename: str | None, pdf_bytes: bytes) -> None:
@@ -800,8 +952,10 @@ def main() -> None:
     app.add_handler(CommandHandler("menu", menu_command))
     app.add_handler(CallbackQueryHandler(calendar_callback, pattern=r"^cal:"))
     app.add_handler(CallbackQueryHandler(policy_client_callback, pattern=r"^polc:"))
+    app.add_handler(CallbackQueryHandler(file_done_callback, pattern=r"^filedone$"))
     app.add_handler(MessageHandler(filters.Document.PDF, handle_policy_or_receipt_pdf))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    app.add_handler(MessageHandler(filters.Document.ALL & ~filters.Document.PDF, handle_generic_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     logger.info("Bot starting (polling)...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
