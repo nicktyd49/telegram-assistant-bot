@@ -11,6 +11,7 @@ from io import BytesIO
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import telegram.error
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from telegram.constants import ParseMode
 from telegram.ext import (
@@ -954,7 +955,15 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
     logged and silently swallowed (this is how the /help crash and the
     illustration-sheet OneDrive sync bug both went unnoticed until someone
     happened to check Railway's logs) — logs it properly AND pings Nic
-    directly in Telegram so a broken feature doesn't sit silently broken."""
+    directly in Telegram so a broken feature doesn't sit silently broken.
+
+    Exception: telegram.error.Conflict during getUpdates. This fires on every
+    redeploy (the old container briefly overlaps with the new one, both
+    polling at once) and PTB retries it internally within seconds on its
+    own — it's not something Nic can act on, so it's logged but not sent."""
+    if isinstance(context.error, telegram.error.Conflict):
+        logger.info("Transient getUpdates conflict (likely an overlapping redeploy) — PTB will retry on its own")
+        return
     logger.error("Unhandled exception while processing an update", exc_info=context.error)
     try:
         trace = "".join(
