@@ -431,7 +431,12 @@ def _recent_clients(limit: int = 8) -> list[str]:
     files = sorted(
         policy_workbook.CLIENT_DIR.glob("*.xlsx"), key=lambda p: p.stat().st_mtime, reverse=True
     )
-    return [f.stem.replace("_", " ") for f in files[:limit]]
+    prefix = policy_workbook.WORKBOOK_FILENAME_PREFIX
+    names = []
+    for f in files[:limit]:
+        stem = f.stem
+        names.append(stem[len(prefix):] if stem.startswith(prefix) else stem)
+    return names
 
 
 def _client_picker_keyboard(names: list[str]) -> InlineKeyboardMarkup | None:
@@ -769,11 +774,12 @@ async def _file_client_item(update: Update, chat_id: int, file_bytes: bytes, sug
         )
         return
 
-    timestamp = datetime.now(ZoneInfo(settings.timezone)).strftime("%Y%m%d_%H%M%S")
-    safe_client = _safe_component(client_name, "Unknown_Client")
-    suffix = Path(suggested_filename).suffix if suggested_filename else ""
-    stem = _safe_component(Path(suggested_filename).stem if suggested_filename else None, "file")
-    remote_path = f"{policy_workbook.ONEDRIVE_WORKBOOK_FOLDER}/{safe_client}/{stem}_{timestamp}{suffix}"
+    safe_client = policy_workbook._onedrive_safe_name(client_name, "Unknown_Client")
+    filename = policy_workbook._onedrive_safe_name(suggested_filename) if suggested_filename else None
+    if not filename:
+        timestamp = datetime.now(ZoneInfo(settings.timezone)).strftime("%Y%m%d_%H%M%S")
+        filename = f"file_{timestamp}"
+    remote_path = f"{policy_workbook.ONEDRIVE_WORKBOOK_FOLDER}/{safe_client}/{filename}"
 
     try:
         await onedrive_service.upload_bytes(remote_path, file_bytes)
@@ -800,7 +806,7 @@ async def _save_original_pdf(client_name: str, filename: str | None, pdf_bytes: 
     configured."""
     stem = _safe_component(Path(filename).stem if filename else None, "policy")
     timestamp = datetime.now(ZoneInfo(settings.timezone)).strftime("%Y%m%d_%H%M%S")
-    client_dir_name = _safe_component(client_name, "Unknown_Client")
+    client_dir_name = policy_workbook._onedrive_safe_name(client_name, "Unknown_Client")
     dest_name = f"{stem}_{timestamp}.pdf"
 
     if settings.onedrive_configured:

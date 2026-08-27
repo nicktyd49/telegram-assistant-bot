@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from typing import Optional
+from urllib.parse import quote
 
 import msal
 import requests
@@ -108,9 +109,11 @@ def _graph_headers() -> dict:
 
 def _upload_bytes_sync(remote_path: str, data: bytes) -> None:
     """remote_path is relative to the OneDrive root, e.g.
-    'Policy Summaries/John_Tan.xlsx'. Parent folders are created
-    automatically by Graph if they don't exist yet."""
-    url = f"{GRAPH_ROOT}/{remote_path}:/content"
+    'Client/John Tan/Policy summary John Tan.xlsx'. Parent folders are
+    created automatically by Graph if they don't exist yet. URL-encoded
+    below since real client/file names can contain spaces and other
+    characters that aren't safe to drop straight into a URL."""
+    url = f"{GRAPH_ROOT}/{quote(remote_path, safe='/')}:/content"
     resp = requests.put(url, headers=_graph_headers(), data=data, timeout=REQUEST_TIMEOUT)
     if resp.status_code >= 300:
         raise RuntimeError(f"OneDrive upload failed ({resp.status_code}): {resp.text[:300]}")
@@ -119,7 +122,7 @@ def _upload_bytes_sync(remote_path: str, data: bytes) -> None:
 def _download_bytes_sync(remote_path: str) -> Optional[bytes]:
     """Returns None (not an error) if the file doesn't exist on OneDrive yet
     — the normal case for a brand-new client."""
-    url = f"{GRAPH_ROOT}/{remote_path}:/content"
+    url = f"{GRAPH_ROOT}/{quote(remote_path, safe='/')}:/content"
     resp = requests.get(url, headers=_graph_headers(), timeout=REQUEST_TIMEOUT)
     if resp.status_code == 404:
         return None

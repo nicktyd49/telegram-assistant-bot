@@ -127,23 +127,38 @@ class PolicyWorkbookError(RuntimeError):
     pass
 
 
+_ONEDRIVE_ILLEGAL_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+
+WORKBOOK_FILENAME_PREFIX = "Policy summary "
+
+
+def _onedrive_safe_name(text: str | None, fallback: str | None = None) -> str | None:
+    """Strips only the characters OneDrive/Windows actually forbid in a file
+    or folder name, keeping spaces and casing intact — so this matches
+    whatever Nic already has saved by hand on OneDrive (e.g. "Tan Zhen
+    Xuan", "Policy summary Johnson.xlsx") instead of underscore-mangling
+    names that were never actually a problem."""
+    cleaned = _ONEDRIVE_ILLEGAL_CHARS.sub("", (text or "")).strip().rstrip(".")
+    return cleaned or fallback
+
+
 def _safe_filename(client_name: str) -> str:
-    cleaned = re.sub(r"[^A-Za-z0-9]+", "_", client_name.strip()).strip("_")
-    return f"{cleaned or 'Unknown_Client'}.xlsx"
+    return f"{WORKBOOK_FILENAME_PREFIX}{_onedrive_safe_name(client_name, 'Unknown Client')}.xlsx"
 
 
 def _client_path(client_name: str) -> Path:
     CLIENT_DIR.mkdir(parents=True, exist_ok=True)
     path = CLIENT_DIR / _safe_filename(client_name)
-    _sync_from_onedrive(path)
+    _sync_from_onedrive(client_name, path)
     return path
 
 
-def _onedrive_remote_path(path: Path) -> str:
-    return f"{ONEDRIVE_WORKBOOK_FOLDER}/{path.stem}/{path.name}"
+def _onedrive_remote_path(client_name: str, path: Path) -> str:
+    folder = _onedrive_safe_name(client_name, "Unknown_Client")
+    return f"{ONEDRIVE_WORKBOOK_FOLDER}/{folder}/{path.name}"
 
 
-def _sync_from_onedrive(path: Path) -> None:
+def _sync_from_onedrive(client_name: str, path: Path) -> None:
     """Pulls the latest saved copy of this client's workbook down from
     OneDrive before we touch it locally, so we're always editing on top of
     the real persisted version rather than whatever (possibly stale, or
@@ -153,7 +168,7 @@ def _sync_from_onedrive(path: Path) -> None:
     if not settings.onedrive_configured:
         return
     try:
-        data = onedrive_service._download_bytes_sync(_onedrive_remote_path(path))
+        data = onedrive_service._download_bytes_sync(_onedrive_remote_path(client_name, path))
     except Exception:  # noqa: BLE001
         logger.exception(
             "Could not check OneDrive for %s — continuing with whatever local copy is on disk",
@@ -164,7 +179,7 @@ def _sync_from_onedrive(path: Path) -> None:
         path.write_bytes(data)
 
 
-def _sync_to_onedrive(path: Path) -> None:
+def _sync_to_onedrive(client_name: str, path: Path) -> None:
     """Pushes the just-saved local workbook up to OneDrive so it survives a
     redeploy. Non-fatal if it fails — the caller already has a good local
     copy to send back to Nic; it just won't be backed up until the next
@@ -172,7 +187,7 @@ def _sync_to_onedrive(path: Path) -> None:
     if not settings.onedrive_configured:
         return
     try:
-        onedrive_service._upload_bytes_sync(_onedrive_remote_path(path), path.read_bytes())
+        onedrive_service._upload_bytes_sync(_onedrive_remote_path(client_name, path), path.read_bytes())
     except Exception:  # noqa: BLE001
         logger.exception(
             "Failed to sync %s to OneDrive — local copy is saved, but it won't survive a redeploy "
@@ -533,7 +548,7 @@ def add_policy_row(client_name: str, fields: dict, date_of_birth: str | None = N
     gap_notes = _coverage_gap_notes(ws, total_row, FIRST_DATA_ROW, last_row)
 
     wb.save(path)
-    _sync_to_onedrive(path)
+    _sync_to_onedrive(client_name, path)
     policy_count = sum(
         1 for r in range(FIRST_DATA_ROW, total_row)
         if ws.cell(row=r, column=2).value not in (None, "")
