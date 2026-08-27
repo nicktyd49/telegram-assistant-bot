@@ -140,7 +140,7 @@ def _client_path(client_name: str) -> Path:
 
 
 def _onedrive_remote_path(path: Path) -> str:
-    return f"{ONEDRIVE_WORKBOOK_FOLDER}/{path.name}"
+    return f"{ONEDRIVE_WORKBOOK_FOLDER}/{path.stem}/{path.name}"
 
 
 def _sync_from_onedrive(path: Path) -> None:

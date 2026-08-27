@@ -773,7 +773,7 @@ async def _file_client_item(update: Update, chat_id: int, file_bytes: bytes, sug
     safe_client = _safe_component(client_name, "Unknown_Client")
     suffix = Path(suggested_filename).suffix if suggested_filename else ""
     stem = _safe_component(Path(suggested_filename).stem if suggested_filename else None, "file")
-    remote_path = f"Client Files/{safe_client}/{stem}_{timestamp}{suffix}"
+    remote_path = f"{policy_workbook.ONEDRIVE_WORKBOOK_FOLDER}/{safe_client}/{stem}_{timestamp}{suffix}"
 
     try:
         await onedrive_service.upload_bytes(remote_path, file_bytes)
@@ -804,7 +804,7 @@ async def _save_original_pdf(client_name: str, filename: str | None, pdf_bytes: 
     dest_name = f"{stem}_{timestamp}.pdf"
 
     if settings.onedrive_configured:
-        remote_path = f"Policy PDFs/{client_dir_name}/{dest_name}"
+        remote_path = f"{policy_workbook.ONEDRIVE_WORKBOOK_FOLDER}/{client_dir_name}/{dest_name}"
         await onedrive_service.upload_bytes(remote_path, pdf_bytes)
         logger.info("Archived original policy PDF to OneDrive: %s", remote_path)
         return
