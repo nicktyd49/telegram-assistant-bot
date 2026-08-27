@@ -543,5 +543,5 @@ def rebuild_illustration_sheet(client_name: str):
         )
 
     wb.save(path)
-    _sync_to_onedrive(path)
+    _sync_to_onedrive(client_name, path)
     return path
