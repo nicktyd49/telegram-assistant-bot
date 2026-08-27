@@ -83,6 +83,25 @@ def _delete_event_sync(event_id: str) -> None:
     service.events().delete(calendarId=settings.google_calendar_id, eventId=event_id).execute()
 
 
+def _list_updated_events_sync(updated_min_iso: str) -> list[dict]:
+    """Events created or changed since updated_min_iso (an RFC3339 UTC
+    timestamp), regardless of when they occur. Used to poll for new
+    invites — showDeleted is off since a cancelled invite isn't something
+    worth notifying about."""
+    service = _get_service()
+    result = (
+        service.events()
+        .list(
+            calendarId=settings.google_calendar_id,
+            updatedMin=updated_min_iso,
+            singleEvents=True,
+            showDeleted=False,
+        )
+        .execute()
+    )
+    return result.get("items", [])
+
+
 def _to_rfc3339(naive_local_iso: str) -> str:
     # timeMin/timeMax need a timezone; googleapiclient accepts an offset-less
     # string as long as we pass timeZone separately via the API params, but
@@ -117,4 +136,12 @@ async def delete_event(event_id: str) -> None:
         await asyncio.to_thread(_delete_event_sync, event_id)
     except HttpError as exc:
         logger.exception("Calendar delete_event failed")
+        raise RuntimeError(f"Google Calendar rejected the request: {exc.reason}") from exc
+
+
+async def list_updated_events(updated_min_iso: str) -> list[dict]:
+    try:
+        return await asyncio.to_thread(_list_updated_events_sync, updated_min_iso)
+    except HttpError as exc:
+        logger.exception("Calendar list_updated_events failed")
         raise RuntimeError(f"Google Calendar rejected the request: {exc.reason}") from exc

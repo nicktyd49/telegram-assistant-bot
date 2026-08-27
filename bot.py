@@ -6,7 +6,7 @@ import json
 import logging
 import re
 import traceback
-from datetime import datetime, timedelta, date, time as dt_time
+from datetime import datetime, timedelta, date, time as dt_time, timezone
 from io import BytesIO
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -983,9 +983,71 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
         logger.exception("Failed to notify about the above error")
 
 
+# In-memory only — resets on redeploy, which just means a fresh baseline
+# (no retroactive notifications), not duplicates. See _check_calendar_invites.
+_invite_watch_state: dict = {"last_checked": None, "notified_ids": set()}
+
+CALENDAR_INVITE_POLL_SECONDS = 600
+
+
+async def _check_calendar_invites(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Runs on a timer (see main()). Polls the calendar for events created
+    or changed since the last check and pings Nic about any where he isn't
+    the organizer — i.e. someone invited him. First run after a (re)start
+    just establishes the baseline instead of notifying about the calendar's
+    entire existing history."""
+    if not settings.calendar_configured:
+        return
+
+    now_iso = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    last_checked = _invite_watch_state["last_checked"]
+    if last_checked is None:
+        _invite_watch_state["last_checked"] = now_iso
+        return
+
+    try:
+        events = await calendar_service.list_updated_events(last_checked)
+    except Exception:  # noqa: BLE001
+        logger.exception("Failed to poll calendar for new invites")
+        return
+    _invite_watch_state["last_checked"] = now_iso
+
+    notified_ids = _invite_watch_state["notified_ids"]
+    for event in events:
+        event_id = event.get("id")
+        if not event_id or event_id in notified_ids:
+            continue
+        notified_ids.add(event_id)
+        if event.get("status") == "cancelled":
+            continue
+        organizer = event.get("organizer", {})
+        if organizer.get("self"):
+            continue  # Nic created this himself, not an invite from someone else
+
+        summary = event.get("summary") or "(no title)"
+        organizer_name = organizer.get("displayName") or organizer.get("email") or "someone"
+        start = event.get("start", {}).get("dateTime") or event.get("start", {}).get("date") or "?"
+        try:
+            start = datetime.fromisoformat(start).strftime("%a %d %b, %H:%M")
+        except ValueError:
+            pass  # all-day event date string, or unparsable — show as-is
+        await context.bot.send_message(
+            chat_id=settings.allowed_user_id,
+            text=f"\U0001F4C5 New calendar invite from {organizer_name}: {summary}\n{start}",
+        )
+
+    # Keep this from growing forever across a long-running process.
+    if len(notified_ids) > 1000:
+        _invite_watch_state["notified_ids"] = set(list(notified_ids)[-500:])
+
+
 def main() -> None:
     app = Application.builder().token(settings.telegram_bot_token).build()
     app.add_error_handler(error_handler)
+    if app.job_queue is not None:
+        app.job_queue.run_repeating(
+            _check_calendar_invites, interval=CALENDAR_INVITE_POLL_SECONDS, first=60
+        )
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("today", today_command))
