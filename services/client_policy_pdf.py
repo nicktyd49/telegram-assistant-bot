@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from datetime import date
 from pathlib import Path
+from xml.sax.saxutils import escape
 
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A3, landscape
@@ -43,8 +44,12 @@ TITLE_STYLE = ParagraphStyle(
     alignment=1, spaceAfter=4,
 )
 NAME_STYLE = ParagraphStyle(
-    "ClientPdfName", parent=_styles["Normal"], fontName="Times-Bold", fontSize=14,
-    textColor=CLIENT_NAME_RED, alignment=1, spaceAfter=2,
+    # Base style is the plain black "Scope of Aggregated Coverage for" label
+    # (matches LABEL_FONT on the real sheet's A3 cell) - the client name
+    # itself is wrapped in inline <b><font color="red"> markup below so only
+    # the name matches CLIENT_NAME_FONT (F3: bold red), not the whole line.
+    "ClientPdfName", parent=_styles["Normal"], fontName="Times-Roman", fontSize=14,
+    alignment=1, spaceAfter=2,
 )
 SUBTITLE_STYLE = ParagraphStyle(
     "ClientPdfSubtitle", parent=_styles["Normal"], fontName="Times-Roman", fontSize=11,
@@ -174,7 +179,11 @@ def build_client_policy_pdf(summary: dict, agent_name: str, output_dir: Path) ->
         topMargin=12 * mm, bottomMargin=12 * mm, leftMargin=10 * mm, rightMargin=10 * mm,
     )
     story = [Paragraph("Policy Summary", TITLE_STYLE)]
-    story.append(Paragraph(f"Scope of Aggregated Coverage for {summary['client_name']}", NAME_STYLE))
+    safe_client_name = escape(summary["client_name"])
+    story.append(Paragraph(
+        f'Scope of Aggregated Coverage for <font color="#FF0000"><b>{safe_client_name}</b></font>',
+        NAME_STYLE,
+    ))
     if summary.get("date_of_birth"):
         story.append(Paragraph(f"Date of Birth: {summary['date_of_birth']}", SUBTITLE_STYLE))
     story.append(Spacer(1, 6 * mm))
