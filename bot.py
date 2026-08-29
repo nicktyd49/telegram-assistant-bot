@@ -1014,20 +1014,14 @@ async def _finish_policy_summary(
     session = pending_policy_session.get(chat_id)
     if session is not None:
         # Batch mode (started via the Policy Summary button) — save the
-        # latest state for this client and only send a short line, so a
-        # stack of PDFs doesn't resend the full reply + file after each one.
+        # latest state for this client and stay silent, so a stack of PDFs
+        # doesn't produce a reply after each one. Errors above (extraction/
+        # save failures) still get their own message either way; this only
+        # skips the success acknowledgment. Nic sees the Done button on the
+        # message he got when he started the session.
         session[client_name] = {
             "count": policy_count, "action_items": action_items, "xlsx_path": xlsx_path,
         }
-        company = fields.get("company") or "Policy"
-        plan = fields.get("plan_type") or ""
-        label = f"{company} — {plan}" if plan else company
-        await message.reply_text(
-            f"Logged: {label} for {client_name} "
-            f"({policy_count} polic{'y' if policy_count == 1 else 'ies'} on file now).\n"
-            "Send another PDF, or tap ✅ Done when you're finished.",
-            reply_markup=_done_policy_keyboard(),
-        )
         return
 
     reply = _format_policy_reply(client_name, fields, policy_count)
