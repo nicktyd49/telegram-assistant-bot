@@ -196,6 +196,16 @@ def _sync_to_onedrive(client_name: str, path: Path) -> None:
         )
 
 
+async def get_workbook_pdf(client_name: str, path: Path) -> bytes:
+    """Converts the client's just-synced workbook to PDF via Microsoft
+    Graph (Excel's own renderer) - a true export of the real file, not a
+    recreation, so what gets sent on Telegram is always pixel-identical to
+    what's actually in the workbook. Requires the workbook to already be
+    on OneDrive (i.e. call this after _sync_to_onedrive)."""
+    remote_path = _onedrive_remote_path(client_name, path)
+    return await onedrive_service.download_pdf(remote_path)
+
+
 async def list_client_names() -> list[str]:
     # All client folder names currently on OneDrive under Client/ - read from
     # OneDrive directly (not the local cache in CLIENT_DIR) since that is the

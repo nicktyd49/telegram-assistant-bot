@@ -973,6 +973,28 @@ async def _save_original_pdf(client_name: str, filename: str | None, pdf_bytes: 
     logger.info("Archived original policy PDF to %s", dest)
 
 
+async def _send_workbook_as_pdf(target, client_name: str, xlsx_path: Path, caption: str) -> None:
+    """Sends the client's workbook as a PDF - a true Graph/Excel export of
+    the real file (services/policy_workbook.get_workbook_pdf), not a
+    recreation - so what Nic gets on Telegram always looks exactly like the
+    actual spreadsheet. Falls back to the .xlsx itself if OneDrive isn't
+    configured or the conversion fails, so filing a policy never breaks
+    just because the PDF export had an issue."""
+    if settings.onedrive_configured:
+        try:
+            pdf_bytes = await policy_workbook.get_workbook_pdf(client_name, xlsx_path)
+            await target.reply_document(
+                document=BytesIO(pdf_bytes),
+                filename=f"{xlsx_path.stem}.pdf",
+                caption=caption,
+            )
+            return
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to convert workbook to PDF - falling back to the .xlsx file")
+    with open(xlsx_path, "rb") as f:
+        await target.reply_document(document=f, filename=xlsx_path.name, caption=caption)
+
+
 async def _finish_policy_summary(
     message, client_name: str, fields: dict,
     pdf_bytes: bytes | None = None, pdf_filename: str | None = None,
@@ -1033,12 +1055,10 @@ async def _finish_policy_summary(
     # can contain a stray underscore/asterisk, which crashes legacy Markdown
     # parsing outright (this is the same bug class the /help crash was).
     await message.reply_text(reply)
-    with open(xlsx_path, "rb") as f:
-        await message.reply_document(
-            document=f,
-            filename=xlsx_path.name,
-            caption=f"Updated policy summary + illustration for {client_name}.",
-        )
+    await _send_workbook_as_pdf(
+        message, client_name, xlsx_path,
+        caption=f"Updated policy summary + illustration for {client_name}.",
+    )
 
 
 async def _close_policy_session(update: Update, chat_id: int, edit: bool = False) -> None:
@@ -1070,12 +1090,10 @@ async def _close_policy_session(update: Update, chat_id: int, edit: bool = False
         await target.reply_text(reply)
         xlsx_path = info.get("xlsx_path")
         if xlsx_path and xlsx_path.exists():
-            with open(xlsx_path, "rb") as f:
-                await target.reply_document(
-                    document=f,
-                    filename=xlsx_path.name,
-                    caption=f"Updated policy summary + illustration for {client_name}.",
-                )
+            await _send_workbook_as_pdf(
+                target, client_name, xlsx_path,
+                caption=f"Updated policy summary + illustration for {client_name}.",
+            )
 
 
 async def policy_done_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

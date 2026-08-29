@@ -131,6 +131,19 @@ def _download_bytes_sync(remote_path: str) -> Optional[bytes]:
     return resp.content
 
 
+def _download_pdf_sync(remote_path: str) -> bytes:
+    """Converts remote_path to PDF using Microsoft's own Excel rendering
+    (Graph's format=pdf content conversion) and returns the PDF bytes.
+    This is a TRUE export of the real file - same fonts, colors, column
+    widths, everything - not a hand-built recreation, so it can never drift
+    out of sync with what the workbook actually looks like."""
+    url = f"{GRAPH_ROOT}/{quote(remote_path, safe='/')}:/content?format=pdf"
+    resp = requests.get(url, headers=_graph_headers(), timeout=REQUEST_TIMEOUT)
+    if resp.status_code >= 300:
+        raise RuntimeError(f"OneDrive PDF conversion failed ({resp.status_code}): {resp.text[:300]}")
+    return resp.content
+
+
 def _list_children_sync(remote_folder: str) -> list[dict]:
     # Lists the immediate children (files and subfolders) of remote_folder,
     # e.g. 'Client'. Returns [] if the folder does not exist yet - nothing
@@ -154,3 +167,7 @@ async def upload_bytes(remote_path: str, data: bytes) -> None:
 
 async def download_bytes(remote_path: str) -> Optional[bytes]:
     return await asyncio.to_thread(_download_bytes_sync, remote_path)
+
+
+async def download_pdf(remote_path: str) -> bytes:
+    return await asyncio.to_thread(_download_pdf_sync, remote_path)
