@@ -36,9 +36,6 @@ SUBTITLE_STYLE = ParagraphStyle(
     "ClientPdfSubtitle", parent=_styles["Normal"], fontName="Times-Roman", fontSize=11,
     textColor=LABEL_GREY, spaceAfter=0,
 )
-POLICY_HEADER_STYLE = ParagraphStyle(
-    "ClientPdfPolicyHeader", parent=_styles["Normal"], fontName="Times-Bold", fontSize=13, spaceBefore=14, spaceAfter=6,
-)
 FOOTER_STYLE = ParagraphStyle(
     "ClientPdfFooter", parent=_styles["Normal"], fontName="Times-Italic", fontSize=9,
     textColor=LABEL_GREY, spaceBefore=18,
@@ -70,8 +67,13 @@ _DETAIL_ROWS = [
 ]
 
 
-def _policy_table(policy: dict) -> Table:
-    rows = []
+def _policy_table(policy: dict, header: str) -> Table:
+    # Matches the look of the real Policy Summary workbook (see
+    # policy_workbook.py's HEADER_FILL/CELL_BORDER): the same light-blue
+    # header band (FF99CCFF) and a bordered grid on every cell, not just a
+    # plain label/value list - this should read as the same document family
+    # as what Nic already sends himself, not a generic export.
+    rows = [[header, ""]]
     for label, key, decimals in _DETAIL_ROWS:
         raw = policy.get(key)
         value = _fmt_money(raw, decimals) if decimals is not None else (str(raw) if raw not in (None, "") else None)
@@ -80,15 +82,23 @@ def _policy_table(policy: dict) -> Table:
         rows.append([label, value])
 
     table = Table(rows, colWidths=[65 * mm, 90 * mm])
-    table.setStyle(TableStyle([
-        ("FONTNAME", (0, 0), (0, -1), "Times-Roman"),
-        ("FONTNAME", (1, 0), (1, -1), "Times-Roman"),
-        ("FONTSIZE", (0, 0), (-1, -1), 10.5),
-        ("TEXTCOLOR", (0, 0), (0, -1), LABEL_GREY),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
-        ("TOPPADDING", (0, 0), (-1, -1), 4),
-        ("LINEBELOW", (0, 0), (-1, -1), 0.4, BORDER_GREY),
-    ]))
+    style = [
+        ("SPAN", (0, 0), (1, 0)),
+        ("BACKGROUND", (0, 0), (1, 0), HEADER_BLUE),
+        ("FONTNAME", (0, 0), (1, 0), "Times-Bold"),
+        ("FONTSIZE", (0, 0), (1, 0), 12),
+        ("ALIGN", (0, 0), (1, 0), "CENTER"),
+        ("TOPPADDING", (0, 0), (1, 0), 6),
+        ("BOTTOMPADDING", (0, 0), (1, 0), 6),
+        ("FONTNAME", (0, 1), (0, -1), "Times-Roman"),
+        ("FONTNAME", (1, 1), (1, -1), "Times-Roman"),
+        ("FONTSIZE", (0, 1), (-1, -1), 10.5),
+        ("TEXTCOLOR", (0, 1), (0, -1), LABEL_GREY),
+        ("BOTTOMPADDING", (0, 1), (-1, -1), 5),
+        ("TOPPADDING", (0, 1), (-1, -1), 5),
+        ("GRID", (0, 0), (-1, -1), 0.6, BORDER_GREY),
+    ]
+    table.setStyle(TableStyle(style))
     return table
 
 
@@ -119,9 +129,9 @@ def build_client_policy_pdf(summary: dict, agent_name: str, output_dir: Path) ->
     for i, policy in enumerate(policies, start=1):
         company = policy.get("company") or "?"
         plan = policy.get("plan_type") or ""
-        header = f"{i}. {company} — {plan}" if plan else f"{i}. {company}"
-        story.append(Paragraph(header, POLICY_HEADER_STYLE))
-        story.append(_policy_table(policy))
+        header = f"Policy {i}: {company} — {plan}" if plan else f"Policy {i}: {company}"
+        story.append(Spacer(1, 10 * mm))
+        story.append(_policy_table(policy, header))
 
     totals = summary.get("totals") or {}
     total_cash = _fmt_money(totals.get("premium_cash"))
