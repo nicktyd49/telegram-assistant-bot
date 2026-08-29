@@ -61,6 +61,15 @@ pending_policy: dict[int, dict] = {}
 # plain file drop) until the session is closed via the Done button.
 pending_client_files: dict[int, dict] = {}
 
+# In-memory per-chat "Policy Summary" batch session state. Maps chat_id ->
+# {client_name: {"count", "action_items", "xlsx_path"}}. While a session is
+# active (started via the Policy Summary button), each PDF still gets saved
+# to the workbook immediately - only the Telegram reply changes, from a full
+# reply+document every single time to one short "logged" line, so sending a
+# stack of policies back-to-back doesn't spam the chat. The full summary and
+# updated file(s) go out once, when the Done button is tapped.
+pending_policy_session: dict[int, dict[str, dict]] = {}
+
 
 def _trim_history(history: list[dict]) -> None:
     """Drops old turns from the front, but only ever starting the kept
@@ -108,12 +117,18 @@ def _done_filing_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton("✅ Done Filing", callback_data="filedone")]])
 
 
+def _done_policy_keyboard() -> InlineKeyboardMarkup:
+    """Shown while a batch 'Policy Summary' session is active."""
+    return InlineKeyboardMarkup([[InlineKeyboardButton("✅ Done", callback_data="policydone")]])
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_allowed(update):
         return
     conversations[update.effective_chat.id] = []
     pending_policy.pop(update.effective_chat.id, None)
     pending_client_files.pop(update.effective_chat.id, None)
+    pending_policy_session.pop(update.effective_chat.id, None)
     await update.message.reply_text(
         "Hi! I'm your personal assistant. I can:\n"
         "- Chat, draft client messages, and answer questions\n"
@@ -519,8 +534,18 @@ async def _menu_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 async def _menu_policy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Starts a batch Policy Summary session - each PDF sent from here is
+    filed immediately, but the full reply + updated file only goes out once,
+    when Done is tapped, so sending several policies in a row doesn't spam
+    the chat with a resend after every single one."""
+    chat_id = update.effective_chat.id
+    pending_client_files.pop(chat_id, None)
+    pending_policy_session[chat_id] = {}
     await update.message.reply_text(
-        "Send me the policy PDF and I'll extract the details and file it under the right client."
+        "Send me the policy PDFs, one at a time - I'll file each one under the right "
+        "client as it comes in. Tap ✅ Done when you're finished and I'll send the full "
+        "summary and updated file(s).",
+        reply_markup=_done_policy_keyboard(),
     )
 
 
@@ -530,6 +555,7 @@ async def _menu_file_client_items(update: Update, context: ContextTypes.DEFAULT_
     Done button is tapped."""
     chat_id = update.effective_chat.id
     pending_policy.pop(chat_id, None)
+    pending_policy_session.pop(chat_id, None)
     pending_client_files[chat_id] = {"client_name": None, "count": 0}
     await update.message.reply_text("Who are these files for? Send me the client's name.")
 
@@ -984,6 +1010,26 @@ async def _finish_policy_summary(
             logger.exception("Failed to archive original policy PDF")
             # Non-fatal — same reasoning as the illustration sheet above.
 
+    chat_id = message.chat_id
+    session = pending_policy_session.get(chat_id)
+    if session is not None:
+        # Batch mode (started via the Policy Summary button) — save the
+        # latest state for this client and only send a short line, so a
+        # stack of PDFs doesn't resend the full reply + file after each one.
+        session[client_name] = {
+            "count": policy_count, "action_items": action_items, "xlsx_path": xlsx_path,
+        }
+        company = fields.get("company") or "Policy"
+        plan = fields.get("plan_type") or ""
+        label = f"{company} — {plan}" if plan else company
+        await message.reply_text(
+            f"Logged: {label} for {client_name} "
+            f"({policy_count} polic{'y' if policy_count == 1 else 'ies'} on file now).\n"
+            "Send another PDF, or tap ✅ Done when you're finished.",
+            reply_markup=_done_policy_keyboard(),
+        )
+        return
+
     reply = _format_policy_reply(client_name, fields, policy_count)
     if action_items:
         reply += f"\n\nNext action for {client_name}:\n" + "\n".join(
@@ -999,6 +1045,52 @@ async def _finish_policy_summary(
             filename=xlsx_path.name,
             caption=f"Updated policy summary + illustration for {client_name}.",
         )
+
+
+async def _close_policy_session(update: Update, chat_id: int, edit: bool = False) -> None:
+    session = pending_policy_session.pop(chat_id, None)
+    total = sum(info["count"] for info in session.values()) if session else 0
+    if not session or total == 0:
+        msg = "Nothing to finish — no policies were filed this session."
+    else:
+        names = ", ".join(session.keys())
+        msg = f"Done — {total} polic{'y' if total == 1 else 'ies'} filed for {names}."
+
+    if edit and update.callback_query:
+        await update.callback_query.edit_message_text(msg)
+        target = update.callback_query.message
+    else:
+        await update.message.reply_text(msg, reply_markup=main_menu_keyboard())
+        target = update.message
+
+    if not session or total == 0:
+        return
+
+    # One wrap-up per client touched this session: next action + the final
+    # workbook, in place of the per-PDF resend batch mode skipped.
+    for client_name, info in session.items():
+        action_items = info.get("action_items") or []
+        reply = f"{client_name} — {info['count']} polic{'y' if info['count'] == 1 else 'ies'} on file."
+        if action_items:
+            reply += "\n\nNext action:\n" + "\n".join(f"- {i['action']}" for i in action_items)
+        await target.reply_text(reply)
+        xlsx_path = info.get("xlsx_path")
+        if xlsx_path and xlsx_path.exists():
+            with open(xlsx_path, "rb") as f:
+                await target.reply_document(
+                    document=f,
+                    filename=xlsx_path.name,
+                    caption=f"Updated policy summary + illustration for {client_name}.",
+                )
+
+
+async def policy_done_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not _is_allowed(update):
+        await query.answer()
+        return
+    await query.answer()
+    await _close_policy_session(update, update.effective_chat.id, edit=True)
 
 
 async def _log_parsed_receipt(update: Update, data: dict) -> None:
@@ -1191,6 +1283,7 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(calendar_callback, pattern=r"^cal:"))
     app.add_handler(CallbackQueryHandler(policy_client_callback, pattern=r"^polc:"))
     app.add_handler(CallbackQueryHandler(file_done_callback, pattern=r"^filedone$"))
+    app.add_handler(CallbackQueryHandler(policy_done_callback, pattern=r"^policydone$"))
     app.add_handler(MessageHandler(filters.Document.PDF, handle_policy_or_receipt_pdf))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.Document.ALL & ~filters.Document.PDF, handle_generic_document))
