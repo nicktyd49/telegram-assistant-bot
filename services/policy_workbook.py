@@ -245,6 +245,8 @@ def get_client_summary(client_name: str) -> dict:
             "plan_type": ws.cell(row=row, column=5).value,  # E
             "premium_cash": ws.cell(row=row, column=6).value,  # F
             "premium_cpf": ws.cell(row=row, column=7).value,  # G
+            "payment_frequency": ws.cell(row=row, column=8).value,  # H
+            "mode_of_payment": ws.cell(row=row, column=9).value,  # I
             "death_coverage": ws.cell(row=row, column=10).value,  # J
             "tpd_coverage": ws.cell(row=row, column=11).value,  # K
             "ci_coverage": ws.cell(row=row, column=12).value,  # L
