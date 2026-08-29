@@ -246,7 +246,12 @@ def get_client_summary(client_name: str) -> dict:
             "premium_cash": ws.cell(row=row, column=6).value,  # F
             "premium_cpf": ws.cell(row=row, column=7).value,  # G
             "death_coverage": ws.cell(row=row, column=10).value,  # J
+            "tpd_coverage": ws.cell(row=row, column=11).value,  # K
             "ci_coverage": ws.cell(row=row, column=12).value,  # L
+            "early_stage_coverage": ws.cell(row=row, column=13).value,  # M
+            "di_coverage": ws.cell(row=row, column=14).value,  # N
+            "accident_lump_sum": ws.cell(row=row, column=15).value,  # O
+            "accident_medical": ws.cell(row=row, column=16).value,  # P
             "remarks": ws.cell(row=row, column=17).value,  # Q
         })
 
@@ -254,7 +259,12 @@ def get_client_summary(client_name: str) -> dict:
         "premium_cash": ws[f"F{total_row}"].value,
         "premium_cpf": ws[f"G{total_row}"].value,
         "death_coverage": ws[f"J{total_row}"].value,
+        "tpd_coverage": ws[f"K{total_row}"].value,
         "ci_coverage": ws[f"L{total_row}"].value,
+        "early_stage_coverage": ws[f"M{total_row}"].value,
+        "di_coverage": ws[f"N{total_row}"].value,
+        "accident_lump_sum": ws[f"O{total_row}"].value,
+        "accident_medical": ws[f"P{total_row}"].value,
     }
 
     action_items = action_items_for(ws, total_row, FIRST_DATA_ROW, last_row)
