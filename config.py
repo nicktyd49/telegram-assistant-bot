@@ -45,6 +45,14 @@ class Settings:
     onedrive_client_id: Optional[str]
     onedrive_token_cache: Optional[str]
 
+    # Client-facing bot (client_bot.py) - a SEPARATE bot/process from this
+    # one, sharing this same Settings object for the pieces that genuinely
+    # are shared (OneDrive, calendar, timezone). All optional: bot.py itself
+    # runs fine without any of these set.
+    client_bot_token: Optional[str]
+    client_bot_username: Optional[str]
+    client_group_chat_id: Optional[int]
+
     @property
     def calendar_configured(self) -> bool:
         return bool(self.google_service_account_info and self.google_calendar_id)
@@ -60,6 +68,10 @@ class Settings:
         upload/download calls, which raise their own clear error if it's
         missing/expired, so it isn't required here."""
         return bool(self.onedrive_client_id)
+
+    @property
+    def client_bot_configured(self) -> bool:
+        return bool(self.client_bot_token)
 
 
 def _load_service_account_info() -> Optional[dict]:
@@ -109,6 +121,10 @@ def load_settings() -> Settings:
     policy_pdf_storage_dir = os.environ.get("POLICY_PDF_STORAGE_DIR", "").strip() or None
     onedrive_client_id = os.environ.get("ONEDRIVE_CLIENT_ID", "").strip() or None
     onedrive_token_cache = os.environ.get("ONEDRIVE_TOKEN_CACHE", "").strip() or None
+    client_bot_token = os.environ.get("CLIENT_BOT_TOKEN", "").strip() or None
+    client_bot_username = os.environ.get("CLIENT_BOT_USERNAME", "").strip().lstrip("@") or None
+    _client_group_chat_id_raw = os.environ.get("CLIENT_GROUP_CHAT_ID", "").strip()
+    client_group_chat_id = int(_client_group_chat_id_raw) if _client_group_chat_id_raw else None
 
     settings = Settings(
         telegram_bot_token=os.environ["TELEGRAM_BOT_TOKEN"],
@@ -125,6 +141,9 @@ def load_settings() -> Settings:
         policy_pdf_storage_dir=policy_pdf_storage_dir,
         onedrive_client_id=onedrive_client_id,
         onedrive_token_cache=onedrive_token_cache,
+        client_bot_token=client_bot_token,
+        client_bot_username=client_bot_username,
+        client_group_chat_id=client_group_chat_id,
     )
 
     if not settings.calendar_configured:

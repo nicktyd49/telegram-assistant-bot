@@ -26,7 +26,7 @@ from telegram.ext import (
 
 from config import settings
 from assistant import anthropic_client, run_conversation
-from services import calendar_service, sheets_service, pdf_utils, policy_workbook, policy_illustration, onedrive_service, action_plan
+from services import calendar_service, sheets_service, pdf_utils, policy_workbook, policy_illustration, onedrive_service, action_plan, client_pairing
 from prompts import POLICY_SUMMARY_PROMPT, RECEIPT_EXTRACTION_PROMPT, POLICY_FIELDS_EXTRACTION_PROMPT
 
 MAX_HISTORY_MESSAGES = 40
@@ -165,6 +165,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "- /today — today's schedule",
         "- /undo — remove the most recently logged receipt (in case of a misread)",
         "- /client <name> — pull up a client policy summary in chat (numbers, coverage, gap notes)",
+        "- /client_code <name> — generate a one-time pairing code so a client can link the client bot to their own policy summary",
         "- /onedrive_setup — connect OneDrive so client files and archived PDFs are backed up" + (
             " (already connected)" if settings.onedrive_token_cache else ""
         ),
@@ -353,6 +354,65 @@ def _format_client_summary(summary: dict) -> str:
             lines.append(f"- {item['action']}")
 
     return "\n".join(lines)
+
+
+async def client_code_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # /client_code <name> - generates a one-time pairing code for the
+    # client-facing bot (client_bot.py), so a client can link their own
+    # Telegram account to their client_name and privately pull up their own
+    # Policy Summary without ever typing anything sensitive like an NRIC.
+    if not _is_allowed(update):
+        return
+    if not settings.onedrive_configured:
+        await update.message.reply_text(
+            "OneDrive isn't connected yet, so I can't look up client files - run /onedrive_setup first."
+        )
+        return
+
+    try:
+        all_clients = await policy_workbook.list_client_names()
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Failed to list clients from OneDrive")
+        await update.message.reply_text(f"Couldn't reach OneDrive to look up clients: {exc}")
+        return
+
+    query = " ".join(context.args).strip() if context.args else ""
+    if not query:
+        await update.message.reply_text("Usage: /client_code <name>")
+        return
+
+    query_lower = query.lower()
+    matches = [c for c in all_clients if query_lower in c.lower()]
+    if not matches:
+        suggestions = difflib.get_close_matches(query, all_clients, n=3)
+        msg = f'No client found matching "{query}".'
+        if suggestions:
+            msg += "\n\nDid you mean:\n" + "\n".join(f"- {s}" for s in suggestions)
+        await update.message.reply_text(msg)
+        return
+    if len(matches) > 1:
+        await update.message.reply_text(
+            "That matches more than one client - which one?\n\n" + "\n".join(f"- {m}" for m in matches)
+        )
+        return
+
+    client_name = matches[0]
+    try:
+        code = await client_pairing.create_code(client_name)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Failed to create pairing code for %s", client_name)
+        await update.message.reply_text(f"Couldn't generate a pairing code: {exc}")
+        return
+
+    reply = f"Pairing code for {client_name}: {code}\nValid for 48 hours, one-time use.\n\n"
+    if settings.client_bot_username:
+        reply += f"Send your client this link:\nhttps://t.me/{settings.client_bot_username}?start={code}"
+    else:
+        reply += (
+            "Send your client this code plus the client bot's username. "
+            "(Set CLIENT_BOT_USERNAME to get a ready-to-send link here instead.)"
+        )
+    await update.message.reply_text(reply)
 
 
 async def client_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1291,6 +1351,7 @@ def main() -> None:
     app.add_handler(CommandHandler("undo", undo_command))
     app.add_handler(CommandHandler("onedrive_setup", onedrive_setup_command))
     app.add_handler(CommandHandler("client", client_command))
+    app.add_handler(CommandHandler("client_code", client_code_command))
     app.add_handler(CommandHandler("menu", menu_command))
     app.add_handler(CallbackQueryHandler(calendar_callback, pattern=r"^cal:"))
     app.add_handler(CallbackQueryHandler(policy_client_callback, pattern=r"^polc:"))

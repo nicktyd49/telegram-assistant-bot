@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import io
 import logging
 import math
 import re
@@ -203,6 +204,41 @@ async def get_workbook_pdf(client_name: str, path: Path) -> bytes:
     what's actually in the workbook. Requires the workbook to already be
     on OneDrive (i.e. call this after _sync_to_onedrive)."""
     remote_path = _onedrive_remote_path(client_name, path)
+    return await onedrive_service.download_pdf(remote_path)
+
+
+# Scratch OneDrive folder for client-facing exports - deliberately NOT
+# under ONEDRIVE_WORKBOOK_FOLDER ("Client/") so these never show up as a
+# fake client folder in list_client_names().
+CLIENT_EXPORT_TEMP_FOLDER = "_bot_tmp"
+
+
+async def get_client_facing_pdf(client_name: str) -> bytes:
+    """Builds a client-safe PDF: a trimmed copy of the real workbook with
+    ONLY the Policy Summary sheet (no Policy Illustration, no Action Plan -
+    Nic presents those in person), converted to PDF via Microsoft Graph so
+    it's a true export of the real sheet, not a hand-built recreation.
+    Raises PolicyWorkbookError if the client has no workbook yet."""
+    # Deliberately NOT _load_client_workbook (which loads data_only=True) -
+    # Q3's Age Next Birthday is a live formula, and openpyxl never computes
+    # formulas itself, so data_only would freeze it as a blank cached value.
+    # Keeping the formula live lets Microsoft's real Excel engine compute it
+    # correctly at PDF-conversion time, same as opening it in Excel would.
+    path = _client_path(client_name)
+    if not path.exists():
+        raise PolicyWorkbookError(f"No policy summary found yet for {client_name}.")
+    wb = openpyxl.load_workbook(path)
+    if SHEET_NAME not in wb.sheetnames:
+        raise PolicyWorkbookError(f"Workbook is missing a '{SHEET_NAME}' sheet")
+    for sheet_name in list(wb.sheetnames):
+        if sheet_name != SHEET_NAME:
+            del wb[sheet_name]
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    safe_name = _onedrive_safe_name(client_name, "Unknown_Client")
+    remote_path = f"{CLIENT_EXPORT_TEMP_FOLDER}/{safe_name}.xlsx"
+    await onedrive_service.upload_bytes(remote_path, buf.getvalue())
     return await onedrive_service.download_pdf(remote_path)
 
 
