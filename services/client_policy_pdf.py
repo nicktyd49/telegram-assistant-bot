@@ -234,7 +234,7 @@ def build_client_policy_pdf(summary: dict, agent_name: str, output_dir: Path) ->
         COL_F: (Paragraph(client_name, CLIENT_NAME_STYLE), COL_I),
     }
     if summary.get("date_of_birth"):
-        row3[COL_J] = (Paragraph("Date of Birth:", LABEL_STYLE), COL_J)
+        row3[COL_J] = (Paragraph("D.O.B:", LABEL_STYLE), COL_J)
         row3[COL_K] = (Paragraph(str(summary["date_of_birth"]), DOB_STYLE), COL_K + 2)
     if summary.get("age_next_birthday") is not None:
         row3[COL_P] = (
