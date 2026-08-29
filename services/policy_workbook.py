@@ -232,6 +232,12 @@ def get_client_summary(client_name: str) -> dict:
 
     dob = ws["K3"].value
     dob_display = _fmt_date_display(dob) if isinstance(dob, date) else (dob or None)
+    age_next_birthday = None
+    if isinstance(dob, date):
+        # Same arithmetic as the live Q3 formula: DATEDIF(K3,TODAY(),"y")+1.
+        today = date.today()
+        completed_years = today.year - dob.year - ((today.month, today.day) < (dob.month, dob.day))
+        age_next_birthday = completed_years + 1
 
     policies = []
     for row in range(FIRST_DATA_ROW, total_row):
@@ -274,6 +280,7 @@ def get_client_summary(client_name: str) -> dict:
     return {
         "client_name": client_name,
         "date_of_birth": dob_display,
+        "age_next_birthday": age_next_birthday,
         "policies": policies,
         "totals": totals,
         "action_items": action_items,
