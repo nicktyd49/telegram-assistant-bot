@@ -26,7 +26,7 @@ from telegram.ext import (
 
 from config import settings
 from assistant import anthropic_client, run_conversation
-from services import calendar_service, sheets_service, pdf_utils, policy_workbook, policy_illustration, onedrive_service
+from services import calendar_service, sheets_service, pdf_utils, policy_workbook, policy_illustration, onedrive_service, action_plan
 from prompts import POLICY_SUMMARY_PROMPT, RECEIPT_EXTRACTION_PROMPT, POLICY_FIELDS_EXTRACTION_PROMPT
 
 MAX_HISTORY_MESSAGES = 40
@@ -332,10 +332,10 @@ def _format_client_summary(summary: dict) -> str:
     if total_bits:
         lines.append(f"\nTotal annual premium: {' + '.join(total_bits)}")
 
-    if summary.get("gap_notes"):
-        lines.append("\n⚠️ Coverage notes:")
-        for note in summary["gap_notes"]:
-            lines.append(f"- {note}")
+    if summary.get("action_items"):
+        lines.append("\n⚠️ Next action:")
+        for item in summary["action_items"]:
+            lines.append(f"- {item['action']}")
 
     return "\n".join(lines)
 
@@ -811,7 +811,7 @@ def _fmt_amount(value) -> str:
 
 def _format_policy_reply(client_name: str, fields: dict, policy_count: int) -> str:
     lines = [
-        f"*Policy logged for {client_name}*",
+        f"Policy logged for {client_name}",
         f"({policy_count} polic{'y' if policy_count == 1 else 'ies'} now on file for this client)",
         "",
         f"Company: {fields.get('company') or '—'}",
@@ -952,7 +952,7 @@ async def _finish_policy_summary(
     pdf_bytes: bytes | None = None, pdf_filename: str | None = None,
 ) -> None:
     try:
-        xlsx_path, policy_count, gap_notes = await asyncio.to_thread(
+        xlsx_path, policy_count, _gap_notes = await asyncio.to_thread(
             policy_workbook.add_policy_row, client_name, fields
         )
     except Exception as exc:  # noqa: BLE001
@@ -969,6 +969,14 @@ async def _finish_policy_summary(
         # Non-fatal — the Policy Summary row is already saved; the illustration
         # tab just won't be refreshed this time.
 
+    action_items = []
+    try:
+        action_items = await asyncio.to_thread(action_plan.rebuild_action_plan_sheet, client_name)
+    except Exception:  # noqa: BLE001
+        logger.exception("Failed to rebuild action plan sheet")
+        # Non-fatal, same reasoning as the illustration sheet above — Nic just
+        # won't get a next-action sheet/message refreshed this time.
+
     if pdf_bytes is not None:
         try:
             await _save_original_pdf(client_name, pdf_filename, pdf_bytes)
@@ -977,9 +985,14 @@ async def _finish_policy_summary(
             # Non-fatal — same reasoning as the illustration sheet above.
 
     reply = _format_policy_reply(client_name, fields, policy_count)
-    if gap_notes:
-        reply += "\n\n*Worth a look:*\n" + "\n".join(f"- {n}" for n in gap_notes)
-    await message.reply_text(reply, parse_mode=ParseMode.MARKDOWN)
+    if action_items:
+        reply += f"\n\nNext action for {client_name}:\n" + "\n".join(
+            f"- {i['action']}" for i in action_items
+        )
+    # Plain text on purpose — fields/remarks come from freeform PDF text and
+    # can contain a stray underscore/asterisk, which crashes legacy Markdown
+    # parsing outright (this is the same bug class the /help crash was).
+    await message.reply_text(reply)
     with open(xlsx_path, "rb") as f:
         await message.reply_document(
             document=f,

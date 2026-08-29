@@ -257,14 +257,14 @@ def get_client_summary(client_name: str) -> dict:
         "ci_coverage": ws[f"L{total_row}"].value,
     }
 
-    gap_notes = _coverage_gap_notes(ws, total_row, FIRST_DATA_ROW, last_row)
+    action_items = action_items_for(ws, total_row, FIRST_DATA_ROW, last_row)
 
     return {
         "client_name": client_name,
         "date_of_birth": dob_display,
         "policies": policies,
         "totals": totals,
-        "gap_notes": gap_notes,
+        "action_items": action_items,
     }
 
 
@@ -649,12 +649,16 @@ def _column_has_coverage(ws, col: str, first_row: int, last_row: int) -> bool:
     return False
 
 
-def _coverage_gap_notes(ws, total_row: int, first_row: int, last_row: int) -> list[str]:
-    """Short, data-driven observations about obvious coverage gaps across ALL
-    of this client's policies on file - meant as talking points for the
-    agent's next conversation with the client, not a definitive assessment."""
+def _coverage_flags(ws, total_row: int, first_row: int, last_row: int) -> dict:
+    # Shared building block for _coverage_gap_notes (flat observations) and
+    # action_items_for (the same gaps phrased as recommended next actions
+    # for the Action Plan sheet / Telegram message) - keeps both in sync
+    # instead of duplicating the coverage-column checks twice.
     if last_row < first_row:
-        return []
+        return {
+            "has_death": False, "has_tpd": False, "has_ci": False,
+            "has_early": False, "has_di": False, "death_total": 0, "ci_total": 0,
+        }
 
     has_death = _column_has_coverage(ws, "J", first_row, last_row)
     has_tpd = _column_has_coverage(ws, "K", first_row, last_row)
@@ -667,17 +671,68 @@ def _coverage_gap_notes(ws, total_row: int, first_row: int, last_row: int) -> li
     death_total = death_total if isinstance(death_total, (int, float)) else 0
     ci_total = ci_total if isinstance(ci_total, (int, float)) else 0
 
+    return {
+        "has_death": has_death, "has_tpd": has_tpd, "has_ci": has_ci,
+        "has_early": has_early, "has_di": has_di,
+        "death_total": death_total, "ci_total": ci_total,
+    }
+
+
+def _coverage_gap_notes(ws, total_row: int, first_row: int, last_row: int) -> list[str]:
+    """Short, data-driven observations about obvious coverage gaps across ALL
+    of this client's policies on file - meant as talking points for the
+    agent's next conversation with the client, not a definitive assessment."""
+    f = _coverage_flags(ws, total_row, first_row, last_row)
+
     notes = []
-    if has_death and not has_ci and not has_early:
+    if f["has_death"] and not f["has_ci"] and not f["has_early"]:
         notes.append("No Critical Illness coverage on file.")
-    if has_death and not has_tpd:
+    if f["has_death"] and not f["has_tpd"]:
         notes.append("No TPD coverage on file.")
-    if has_death and not has_di:
+    if f["has_death"] and not f["has_di"]:
         notes.append("No Disability Income coverage on file.")
-    if has_ci and death_total > 0 and ci_total > 0 and ci_total < CI_THIN_RATIO * death_total:
+    if f["has_ci"] and f["death_total"] > 0 and f["ci_total"] > 0 and f["ci_total"] < CI_THIN_RATIO * f["death_total"]:
         notes.append(
-            f"CI coverage (${ci_total:,.0f}) looks thin next to Death coverage (${death_total:,.0f})."
+            f"CI coverage (${f['ci_total']:,.0f}) looks thin next to Death coverage (${f['death_total']:,.0f})."
         )
 
     return notes[:3]
+
+
+def action_items_for(ws, total_row: int, first_row: int, last_row: int) -> list[dict]:
+    """Same coverage-gap detection as _coverage_gap_notes, phrased instead as
+    {"gap": ..., "action": ...} - what's actually shown on the Action Plan
+    sheet and sent to Nic on Telegram after a policy is logged. Always
+    returns at least one item, so there is never a case with "gaps found"
+    but no stated next step."""
+    f = _coverage_flags(ws, total_row, first_row, last_row)
+
+    items = []
+    if f["has_death"] and not f["has_ci"] and not f["has_early"]:
+        items.append({
+            "gap": "No Critical Illness coverage on file.",
+            "action": "Discuss adding Critical Illness coverage at the next review.",
+        })
+    if f["has_death"] and not f["has_tpd"]:
+        items.append({
+            "gap": "No TPD coverage on file.",
+            "action": "Discuss adding Total & Permanent Disability coverage.",
+        })
+    if f["has_death"] and not f["has_di"]:
+        items.append({
+            "gap": "No Disability Income coverage on file.",
+            "action": "Discuss adding Disability Income coverage to protect their monthly income.",
+        })
+    if f["has_ci"] and f["death_total"] > 0 and f["ci_total"] > 0 and f["ci_total"] < CI_THIN_RATIO * f["death_total"]:
+        items.append({
+            "gap": f"CI coverage (${f['ci_total']:,.0f}) looks thin next to Death coverage (${f['death_total']:,.0f}).",
+            "action": "Review whether Critical Illness coverage should be increased.",
+        })
+    if not items:
+        items.append({
+            "gap": "No obvious coverage gaps found.",
+            "action": "No urgent action - consider a routine check-in for life changes (marriage, kids, income change).",
+        })
+
+    return items[:4]
 
