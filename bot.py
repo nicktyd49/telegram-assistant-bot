@@ -26,7 +26,7 @@ from telegram.ext import (
 
 from config import settings
 from assistant import anthropic_client, run_conversation
-from services import calendar_service, sheets_service, pdf_utils, policy_workbook, policy_illustration, onedrive_service, action_plan, client_pairing, news_service
+from services import calendar_service, sheets_service, pdf_utils, policy_workbook, policy_illustration, onedrive_service, action_plan, client_pairing, news_service, poster_service
 from prompts import POLICY_SUMMARY_PROMPT, RECEIPT_EXTRACTION_PROMPT, POLICY_FIELDS_EXTRACTION_PROMPT
 
 MAX_HISTORY_MESSAGES = 40
@@ -44,6 +44,7 @@ MENU_POLICY = "📄 Policy Summary"
 MENU_FILE = "🗂 File Client Items"
 MENU_HELP = "❓ Help"
 MENU_NEWS = "📰 News"
+MENU_POSTER = "📊 Market Poster"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("assistant-bot")
@@ -71,6 +72,14 @@ pending_client_files: dict[int, dict] = {}
 # updated file(s) go out once, when the Done button is tapped.
 pending_policy_session: dict[int, dict[str, dict]] = {}
 
+# In-memory per-chat "Market Poster" note-collection session state. Maps
+# chat_id -> {"parts": [...]} where parts is an ordered list of the raw
+# text/photo pieces Nic sends (see poster_service.extract_poster_content).
+# pending_poster_preview holds the rendered PNG + brief for the just-built
+# poster, keyed by chat_id, until Nic approves or discards it.
+pending_poster_session: dict[int, dict] = {}
+pending_poster_preview: dict[int, dict] = {}
+
 
 def _trim_history(history: list[dict]) -> None:
     """Drops old turns from the front, but only ever starting the kept
@@ -94,7 +103,7 @@ def _is_allowed(update: Update) -> bool:
 def main_menu_keyboard() -> ReplyKeyboardMarkup:
     """The persistent row of buttons at the bottom of the chat."""
     return ReplyKeyboardMarkup(
-        [[MENU_CALENDAR, MENU_RECEIPT], [MENU_POLICY, MENU_FILE], [MENU_NEWS, MENU_HELP]],
+        [[MENU_CALENDAR, MENU_RECEIPT], [MENU_POLICY, MENU_FILE], [MENU_NEWS, MENU_POSTER], [MENU_HELP]],
         resize_keyboard=True,
     )
 
@@ -121,6 +130,19 @@ def _done_filing_keyboard() -> InlineKeyboardMarkup:
 def _done_policy_keyboard() -> InlineKeyboardMarkup:
     """Shown while a batch 'Policy Summary' session is active."""
     return InlineKeyboardMarkup([[InlineKeyboardButton("✅ Done", callback_data="policydone")]])
+
+
+def _done_poster_keyboard() -> InlineKeyboardMarkup:
+    """Shown while a 'Market Poster' note-collection session is active."""
+    return InlineKeyboardMarkup([[InlineKeyboardButton("✅ Build Poster", callback_data="posterdone")]])
+
+
+def _poster_review_keyboard() -> InlineKeyboardMarkup:
+    """Shown under the generated poster preview, before it goes to clients."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Post to client group", callback_data="posterpost"),
+         InlineKeyboardButton("🗑 Discard", callback_data="posterdiscard")],
+    ])
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -168,6 +190,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "- /client <name> — pull up a client policy summary in chat (numbers, coverage, gap notes)",
         "- /client_code <name> — generate a one-time pairing code so a client can link the client bot to their own policy summary",
         "- /news — on-demand insurance news digest (Singapore-focused)",
+        "- 📊 Market Poster (button below) — turn your fund house talk notes into a "
+        "client-ready poster, with a preview to approve before it goes to your client group",
         "- /onedrive_setup — connect OneDrive so client files and archived PDFs are backed up" + (
             " (already connected)" if settings.onedrive_token_cache else ""
         ),
@@ -433,6 +457,102 @@ async def news_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await update.message.reply_text(digest)
 
 
+async def _build_poster(message, chat_id: int) -> None:
+    """Shared by the 'done' text command and the ✅ Build Poster button —
+    extracts the structured brief from whatever's been collected, renders
+    it, and sends a preview with approve/discard buttons. `message` is any
+    telegram.Message to reply from (the user's message, or the message a
+    button was attached to)."""
+    state = pending_poster_session.pop(chat_id, None)
+    parts = state["parts"] if state else []
+    if not parts:
+        await message.reply_text(
+            "Nothing to build a poster from — send some notes or slide photos first.",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+
+    await message.chat.send_action("upload_photo")
+    try:
+        brief = await poster_service.extract_poster_content(parts)
+        png_bytes = poster_service.render_poster_image(brief, signoff_name=settings.agent_name)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Failed to build market poster")
+        await message.reply_text(f"Couldn't build the poster: {exc}", reply_markup=main_menu_keyboard())
+        return
+
+    pending_poster_preview[chat_id] = {"png": png_bytes, "brief": brief}
+    await message.reply_photo(
+        photo=BytesIO(png_bytes),
+        filename="market_outlook.png",
+        caption="Here's the preview — post this to your client group, or discard it.",
+        reply_markup=_poster_review_keyboard(),
+    )
+
+
+async def poster_done_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not _is_allowed(update):
+        await query.answer()
+        return
+    await query.answer()
+    await _build_poster(query.message, update.effective_chat.id)
+
+
+async def poster_post_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not _is_allowed(update):
+        await query.answer()
+        return
+    await query.answer()
+    chat_id = update.effective_chat.id
+    pending = pending_poster_preview.pop(chat_id, None)
+    if not pending:
+        await query.message.reply_text("That preview has expired — build the poster again first.")
+        return
+    if not settings.client_group_chat_id:
+        await query.message.reply_text(
+            "The client group isn't connected yet — add me to that Telegram group, then send "
+            "/groupid in the group and set CLIENT_GROUP_CHAT_ID to that number on Railway. "
+            "The poster above is still there, so you can forward it yourself for now."
+        )
+        return
+    try:
+        await context.bot.send_photo(
+            chat_id=settings.client_group_chat_id,
+            photo=BytesIO(pending["png"]),
+            filename="market_outlook.png",
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Failed to post poster to client group")
+        await query.message.reply_text(f"Couldn't post to the client group: {exc}")
+        return
+    await query.message.reply_text("Posted to your client group ✅", reply_markup=main_menu_keyboard())
+
+
+async def poster_discard_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not _is_allowed(update):
+        await query.answer()
+        return
+    await query.answer()
+    pending_poster_preview.pop(update.effective_chat.id, None)
+    await query.message.reply_text("Discarded — nothing was sent.", reply_markup=main_menu_keyboard())
+
+
+async def groupid_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Run this inside the client group (after adding the bot to it) to get
+    the group's chat ID for CLIENT_GROUP_CHAT_ID on Railway — that's the
+    only thing connecting /poster's 'Post to client group' button to an
+    actual group."""
+    if not _is_allowed(update):
+        return
+    chat = update.effective_chat
+    await update.message.reply_text(
+        f"This chat's ID is: {chat.id}\n\nSet CLIENT_GROUP_CHAT_ID to this on Railway."
+    )
+
+
 async def client_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     # /client <name> - pulls up a client's policy summary numbers straight in
     # chat, so Nic does not need to open OneDrive/Excel on his phone mid-call
@@ -638,6 +758,23 @@ async def _menu_file_client_items(update: Update, context: ContextTypes.DEFAULT_
     await update.message.reply_text("Who are these files for? Send me the client's name.")
 
 
+async def _menu_poster(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Starts a 'Market Poster' session — collects typed notes and/or photos
+    of fund house slides until Done is tapped, then turns them into a
+    client-ready poster image for review before it goes to the client group."""
+    chat_id = update.effective_chat.id
+    pending_policy.pop(chat_id, None)
+    pending_policy_session.pop(chat_id, None)
+    pending_client_files.pop(chat_id, None)
+    pending_poster_preview.pop(chat_id, None)
+    pending_poster_session[chat_id] = {"parts": []}
+    await update.message.reply_text(
+        "Send me your notes from the fund house talk — typed notes, photos of the slides, "
+        "whatever you've got, in any order. Tap ✅ Build Poster below when you're done.",
+        reply_markup=_done_poster_keyboard(),
+    )
+
+
 # Persistent-keyboard button text -> handler. Checked first in handle_message
 # so tapping a button doesn't fall through to the general chat assistant.
 MENU_ACTIONS = {
@@ -646,6 +783,7 @@ MENU_ACTIONS = {
     MENU_POLICY: _menu_policy,
     MENU_FILE: _menu_file_client_items,
     MENU_NEWS: news_command,
+    MENU_POSTER: _menu_poster,
     MENU_HELP: help_command,
 }
 
@@ -729,6 +867,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         pending_policy.pop(chat_id, None)
         if text_raw != MENU_FILE:
             pending_client_files.pop(chat_id, None)
+        if text_raw != MENU_POSTER:
+            pending_poster_session.pop(chat_id, None)
+            pending_poster_preview.pop(chat_id, None)
         await MENU_ACTIONS[text_raw](update, context)
         return
 
@@ -766,6 +907,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             f"Still filing under {state['client_name']} ({state.get('count', 0)} file(s) so far). "
             "Send more files, or tap ✅ Done Filing to finish.",
             reply_markup=_done_filing_keyboard(),
+        )
+        return
+
+    if chat_id in pending_poster_session:
+        if text_raw.strip().lower() in {"done", "finish"}:
+            await _build_poster(update.message, chat_id)
+            return
+        pending_poster_session[chat_id]["parts"].append({"type": "text", "text": text_raw})
+        count = len(pending_poster_session[chat_id]["parts"])
+        await update.message.reply_text(
+            f"Got it ({count} item(s) so far). Send more notes/photos, or tap ✅ Build Poster to finish.",
+            reply_markup=_done_poster_keyboard(),
         )
         return
 
@@ -840,6 +993,18 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     if chat_id in pending_client_files and pending_client_files[chat_id].get("client_name"):
         await _file_client_item(update, chat_id, image_bytes, f"{photo.file_unique_id}.jpg")
+        return
+
+    if chat_id in pending_poster_session:
+        image_b64_poster = base64.b64encode(image_bytes).decode("ascii")
+        pending_poster_session[chat_id]["parts"].append(
+            {"type": "image", "media_type": "image/jpeg", "data": image_b64_poster}
+        )
+        count = len(pending_poster_session[chat_id]["parts"])
+        await update.message.reply_text(
+            f"Got it ({count} item(s) so far). Send more notes/photos, or tap ✅ Build Poster to finish.",
+            reply_markup=_done_poster_keyboard(),
+        )
         return
 
     caption = (update.message.caption or "").lower()
@@ -1364,6 +1529,8 @@ async def _post_init(app: Application) -> None:
     await app.bot.set_my_commands([
         BotCommand("today", "Today's schedule"),
         BotCommand("news", "On-demand insurance news digest"),
+        BotCommand("poster", "Build a market outlook poster from your notes"),
+        BotCommand("groupid", "Get this chat's ID (run inside your client group)"),
         BotCommand("client", "Look up a client's policy summary"),
         BotCommand("client_code", "Generate a client pairing code"),
         BotCommand("undo", "Remove the most recently logged receipt"),
@@ -1388,11 +1555,16 @@ def main() -> None:
     app.add_handler(CommandHandler("client", client_command))
     app.add_handler(CommandHandler("client_code", client_code_command))
     app.add_handler(CommandHandler("news", news_command))
+    app.add_handler(CommandHandler("poster", _menu_poster))
+    app.add_handler(CommandHandler("groupid", groupid_command))
     app.add_handler(CommandHandler("menu", menu_command))
     app.add_handler(CallbackQueryHandler(calendar_callback, pattern=r"^cal:"))
     app.add_handler(CallbackQueryHandler(policy_client_callback, pattern=r"^polc:"))
     app.add_handler(CallbackQueryHandler(file_done_callback, pattern=r"^filedone$"))
     app.add_handler(CallbackQueryHandler(policy_done_callback, pattern=r"^policydone$"))
+    app.add_handler(CallbackQueryHandler(poster_done_callback, pattern=r"^posterdone$"))
+    app.add_handler(CallbackQueryHandler(poster_post_callback, pattern=r"^posterpost$"))
+    app.add_handler(CallbackQueryHandler(poster_discard_callback, pattern=r"^posterdiscard$"))
     app.add_handler(MessageHandler(filters.Document.PDF, handle_policy_or_receipt_pdf))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.Document.ALL & ~filters.Document.PDF, handle_generic_document))
