@@ -13,7 +13,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import telegram.error
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, BotCommand
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
@@ -43,6 +43,7 @@ MENU_RECEIPT = "🧾 Log Receipt"
 MENU_POLICY = "📄 Policy Summary"
 MENU_FILE = "🗂 File Client Items"
 MENU_HELP = "❓ Help"
+MENU_NEWS = "📰 News"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("assistant-bot")
@@ -93,7 +94,7 @@ def _is_allowed(update: Update) -> bool:
 def main_menu_keyboard() -> ReplyKeyboardMarkup:
     """The persistent row of buttons at the bottom of the chat."""
     return ReplyKeyboardMarkup(
-        [[MENU_CALENDAR, MENU_RECEIPT], [MENU_POLICY, MENU_FILE], [MENU_HELP]],
+        [[MENU_CALENDAR, MENU_RECEIPT], [MENU_POLICY, MENU_FILE], [MENU_NEWS, MENU_HELP]],
         resize_keyboard=True,
     )
 
@@ -644,6 +645,7 @@ MENU_ACTIONS = {
     MENU_RECEIPT: _menu_receipt,
     MENU_POLICY: _menu_policy,
     MENU_FILE: _menu_file_client_items,
+    MENU_NEWS: news_command,
     MENU_HELP: help_command,
 }
 
@@ -1355,8 +1357,24 @@ async def _check_calendar_invites(context: ContextTypes.DEFAULT_TYPE) -> None:
         _invite_watch_state["notified_ids"] = set(list(notified_ids)[-500:])
 
 
+async def _post_init(app: Application) -> None:
+    # Populates the "/" slash-command menu in Telegram's UI (the small icon
+    # next to the text box) - purely cosmetic/discoverability, the commands
+    # themselves work via CommandHandler regardless of this.
+    await app.bot.set_my_commands([
+        BotCommand("today", "Today's schedule"),
+        BotCommand("news", "On-demand insurance news digest"),
+        BotCommand("client", "Look up a client's policy summary"),
+        BotCommand("client_code", "Generate a client pairing code"),
+        BotCommand("undo", "Remove the most recently logged receipt"),
+        BotCommand("onedrive_setup", "Connect OneDrive"),
+        BotCommand("menu", "Show the tap-to-use buttons"),
+        BotCommand("help", "What I can do"),
+    ])
+
+
 def main() -> None:
-    app = Application.builder().token(settings.telegram_bot_token).build()
+    app = Application.builder().token(settings.telegram_bot_token).post_init(_post_init).build()
     app.add_error_handler(error_handler)
     if app.job_queue is not None:
         app.job_queue.run_repeating(
