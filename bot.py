@@ -26,7 +26,7 @@ from telegram.ext import (
 
 from config import settings
 from assistant import anthropic_client, run_conversation
-from services import calendar_service, sheets_service, pdf_utils, policy_workbook, policy_illustration, onedrive_service, action_plan, client_pairing
+from services import calendar_service, sheets_service, pdf_utils, policy_workbook, policy_illustration, onedrive_service, action_plan, client_pairing, news_service
 from prompts import POLICY_SUMMARY_PROMPT, RECEIPT_EXTRACTION_PROMPT, POLICY_FIELDS_EXTRACTION_PROMPT
 
 MAX_HISTORY_MESSAGES = 40
@@ -166,6 +166,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "- /undo — remove the most recently logged receipt (in case of a misread)",
         "- /client <name> — pull up a client policy summary in chat (numbers, coverage, gap notes)",
         "- /client_code <name> — generate a one-time pairing code so a client can link the client bot to their own policy summary",
+        "- /news — on-demand insurance news digest (Singapore-focused)",
         "- /onedrive_setup — connect OneDrive so client files and archived PDFs are backed up" + (
             " (already connected)" if settings.onedrive_token_cache else ""
         ),
@@ -413,6 +414,22 @@ async def client_code_command(update: Update, context: ContextTypes.DEFAULT_TYPE
             "(Set CLIENT_BOT_USERNAME to get a ready-to-send link here instead.)"
         )
     await update.message.reply_text(reply)
+
+
+async def news_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # /news - on-demand insurance news digest, using Claude's built-in web
+    # search tool (no separate news API/subscription needed). Kept simple:
+    # no caching, no schedule - just fetches fresh each time it's asked for.
+    if not _is_allowed(update):
+        return
+    await update.message.reply_chat_action("typing")
+    try:
+        digest = await news_service.get_insurance_news_digest()
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Failed to build insurance news digest")
+        await update.message.reply_text(f"Couldn't pull a news digest right now: {exc}")
+        return
+    await update.message.reply_text(digest)
 
 
 async def client_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1352,6 +1369,7 @@ def main() -> None:
     app.add_handler(CommandHandler("onedrive_setup", onedrive_setup_command))
     app.add_handler(CommandHandler("client", client_command))
     app.add_handler(CommandHandler("client_code", client_code_command))
+    app.add_handler(CommandHandler("news", news_command))
     app.add_handler(CommandHandler("menu", menu_command))
     app.add_handler(CallbackQueryHandler(calendar_callback, pattern=r"^cal:"))
     app.add_handler(CallbackQueryHandler(policy_client_callback, pattern=r"^polc:"))
