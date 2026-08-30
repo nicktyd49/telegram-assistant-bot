@@ -14,7 +14,7 @@ from zoneinfo import ZoneInfo
 
 import telegram.error
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, BotCommand
-from telegram.constants import ParseMode
+from telegram.constants import ParseMode, ChatType
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -541,14 +541,23 @@ async def poster_discard_callback(update: Update, context: ContextTypes.DEFAULT_
 
 
 async def groupid_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Run this inside the client group (after adding the bot to it) to get
-    the group's chat ID for CLIENT_GROUP_CHAT_ID on Railway — that's the
-    only thing connecting /poster's 'Post to client group' button to an
-    actual group."""
-    if not _is_allowed(update):
-        return
+    """Run this inside the client group/channel (after adding the bot to it)
+    to get its chat ID for CLIENT_GROUP_CHAT_ID on Railway — that's the only
+    thing connecting /poster's 'Post to client group' button to an actual
+    destination.
+
+    Channel posts are handled as a special case: the Bot API never attaches
+    a user identity to a channel post (Telegram hides the author), so the
+    normal _is_allowed() check would silently reject it. Since the bot can
+    only be an admin of channels Nic himself added it to, any channel_post
+    reaching this handler is inherently trusted."""
     chat = update.effective_chat
-    await update.message.reply_text(
+    message = update.effective_message
+    if chat is None or message is None:
+        return
+    if chat.type != ChatType.CHANNEL and not _is_allowed(update):
+        return
+    await message.reply_text(
         f"This chat's ID is: {chat.id}\n\nSet CLIENT_GROUP_CHAT_ID to this on Railway."
     )
 
