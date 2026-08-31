@@ -845,12 +845,7 @@ async def handle_channel_join(update: Update, context: ContextTypes.DEFAULT_TYPE
 def _free_slots(events: list[dict], day: date) -> list[tuple[datetime, datetime]]:
     """Gaps of at least MEETING_SLOT_MINUTES between events, clamped to the
     business-hours window for that day, chopped into fixed-length chunks a
-    client can pick as one button. An all-day event (no dateTime, just a
-    date - e.g. blocking out a whole day for a roadshow or external
-    training without picking exact hours) blocks the ENTIRE window for that
-    day, same as if it were fully booked - previously these were silently
-    ignored, which meant a day Nic had marked out with an all-day entry
-    still showed every hour as bookable to clients."""
+    client can pick as one button."""
     tz = ZoneInfo(settings.timezone)
     window_start = datetime.combine(day, dt_time(WORK_START_HOUR, 0), tzinfo=tz)
     window_end = datetime.combine(day, dt_time(WORK_END_HOUR, 0), tzinfo=tz)
@@ -860,8 +855,6 @@ def _free_slots(events: list[dict], day: date) -> list[tuple[datetime, datetime]
         s = e.get("start", {}).get("dateTime")
         en = e.get("end", {}).get("dateTime")
         if not s or not en:
-            if e.get("start", {}).get("date"):
-                return []  # all-day event on this day - treat the whole day as blocked
             continue
         try:
             s_dt = datetime.fromisoformat(s)
