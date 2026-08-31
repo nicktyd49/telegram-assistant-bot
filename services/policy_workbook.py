@@ -563,6 +563,22 @@ def _build_new_workbook():
     return wb
 
 
+def create_blank_client(client_name: str) -> None:
+    """Creates an empty workbook (and therefore, as a side effect, an empty
+    OneDrive client folder) for a brand-new client the moment they're
+    paired - before any policy PDF has actually been submitted. Used by
+    client_bot.py's auto-pair-a-referral flow, so a friend who joins via
+    Invite Friends and gives their name sees their folder on OneDrive right
+    away rather than only once they first submit a document. No-op if a
+    workbook already exists for this name - never overwrites real data."""
+    path = _client_path(client_name)
+    if path.exists():
+        return
+    wb = _build_new_workbook()
+    wb.save(path)
+    _sync_to_onedrive(client_name, path)
+
+
 def _open_or_create(client_name: str):
     path = _client_path(client_name)
     if path.exists():

@@ -36,14 +36,16 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import uuid
 from datetime import date, datetime, timedelta, time as dt_time
 from io import BytesIO
 from zoneinfo import ZoneInfo
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
+from telegram import ChatMember, Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
+    ChatMemberHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -51,7 +53,7 @@ from telegram.ext import (
 )
 
 from config import settings
-from services import calendar_service, policy_workbook, client_pairing
+from services import calendar_service, policy_workbook, policy_extraction, client_pairing
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("client-bot")
@@ -102,6 +104,15 @@ pending_submission: dict[int, dict] = {}
 # after a restart just mints a fresh link, which is harmless (just one more
 # named link sitting in the channel's admin panel).
 client_invite_links: dict[str, str] = {}
+
+# Auto-extraction approval state, keyed by a short random token (Telegram
+# callback_data has a size limit, so this is an indirection rather than
+# putting client_name straight in the button). Set when a paired client's
+# submitted document is auto-extracted and Nic is shown a "Send to client"
+# button; cleared once he taps it. Lost on restart like the rest of this
+# bot's pending state - worst case Nic has to resubmit/re-forward the
+# document, nothing destructive.
+pending_client_approval: dict[str, str] = {}
 
 
 def _client_label(user) -> str:
@@ -163,11 +174,73 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
+    awaiting = await client_pairing.get_awaiting_name(user_id)
+    if awaiting:
+        referred_by = awaiting.get("referred_by")
+        intro = f"Welcome! You joined via {referred_by}'s invite. " if referred_by else "Welcome! "
+        await update.message.reply_text(
+            intro + "To get you set up, what's your full name? This is how I'll file your policy records."
+        )
+        return
+
     await update.message.reply_text(
         "Hi! You can book a meeting any time — no code needed. To see your policy summary or "
         "send a document, I'll need a one-time pairing code from your agent first.",
         reply_markup=_menu_keyboard(paired=False),
     )
+
+
+async def _handle_new_client_name(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int, text: str, awaiting: dict,
+) -> None:
+    """Handles a free-text reply from a Telegram user who joined the Wealth
+    Circle channel via a named Invite Friends link and is now being asked
+    for their full name (see start() / handle_private_text()). Validates
+    against existing client names first - so a typo or a joke reply can
+    never silently attach itself to a real client's existing OneDrive
+    folder - then creates a blank workbook for them, pairs them directly
+    (no code needed), and lets Nic know."""
+    full_name = text.strip()
+    if len(full_name) < 2:
+        await update.message.reply_text(
+            "Could you send your full name, please? This is how I'll file your policy records."
+        )
+        return
+
+    existing_names = await policy_workbook.list_client_names()
+    if any(full_name.lower() == n.lower() for n in existing_names):
+        await update.message.reply_text(
+            f"{settings.agent_name} already has a client on file under that exact name — to avoid mixing "
+            f"up records, please double-check the spelling, or let {settings.agent_name} know directly."
+        )
+        return
+
+    try:
+        await asyncio.to_thread(policy_workbook.create_blank_client, full_name)
+    except Exception:  # noqa: BLE001
+        logger.exception("Failed to create blank OneDrive workbook for new referred client %s", full_name)
+        await update.message.reply_text(
+            "Sorry, something went wrong setting up your records — please try again in a moment."
+        )
+        return
+
+    await client_pairing.pair_directly(user_id, full_name)
+    await client_pairing.clear_awaiting_name(user_id)
+
+    await update.message.reply_text(
+        f"Thanks, {full_name} — you're all set! Use the menu below any time.",
+        reply_markup=_menu_keyboard(paired=True),
+    )
+
+    referred_by = awaiting.get("referred_by")
+    note = f" (referred by {referred_by})" if referred_by else ""
+    try:
+        await context.bot.send_message(
+            chat_id=settings.allowed_user_id,
+            text=f"✅ New client auto-paired: {full_name}{note}\nA blank policy folder has been created on OneDrive.",
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("Could not notify Nic about new auto-paired client %s", full_name)
 
 
 async def handle_private_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -177,6 +250,16 @@ async def handle_private_text(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
     text = (update.message.text or "").strip()
     user_id = update.effective_user.id
+
+    # A brand-new referred joiner giving their full name takes top priority
+    # - they aren't paired yet, so none of the other branches below apply
+    # to them anyway, and this needs to resolve before they can do anything
+    # else with the bot.
+    if text not in MENU_TEXTS:
+        awaiting = await client_pairing.get_awaiting_name(user_id)
+        if awaiting:
+            await _handle_new_client_name(update, context, user_id, text, awaiting)
+            return
 
     # A pending referral takes priority over everything except tapping a
     # real menu button (so a client can back out of it by just tapping
@@ -490,9 +573,15 @@ async def handle_private_submission(update: Update, context: ContextTypes.DEFAUL
         return
 
     if message.document:
-        file_info = {"kind": "document", "file_id": message.document.file_id, "caption": message.caption}
+        file_info = {
+            "kind": "document", "file_id": message.document.file_id, "caption": message.caption,
+            "filename": message.document.file_name,
+        }
     elif message.photo:
-        file_info = {"kind": "photo", "file_id": message.photo[-1].file_id, "caption": message.caption}
+        file_info = {
+            "kind": "photo", "file_id": message.photo[-1].file_id, "caption": message.caption,
+            "filename": None,
+        }
     else:
         return
 
@@ -574,6 +663,178 @@ async def _finish_submission(update: Update, context: ContextTypes.DEFAULT_TYPE,
         return
 
     await update.message.reply_text(f"Sent to {settings.agent_name} — thanks!")
+
+    if file_info["kind"] == "document":
+        await _try_auto_extract(context, client_name, file_info)
+
+
+async def _try_auto_extract(context: ContextTypes.DEFAULT_TYPE, client_name: str, file_info: dict) -> None:
+    """Best-effort: downloads the just-submitted document, runs it through
+    the same Claude extraction Nic's own bot uses (services/
+    policy_extraction.py), saves it into the client's workbook, and sends
+    Nic a preview of the finished policy summary with a one-tap "Send to
+    client" button - so a routine submission doesn't need Nic to manually
+    re-forward the document into his own bot first. He still reviews and
+    approves before the client sees anything; nothing here auto-sends.
+
+    Silent no-op on any failure (e.g. a scanned PDF with no text layer) -
+    the plain relay above already went through either way, so Nic can
+    still process the document by hand exactly as before."""
+    try:
+        tg_file = await context.bot.get_file(file_info["file_id"])
+        pdf_bytes = bytes(await tg_file.download_as_bytearray())
+    except Exception:  # noqa: BLE001
+        logger.exception("Could not download submitted document for auto-extraction")
+        return
+
+    try:
+        fields = await policy_extraction.extract_policy_fields(pdf_bytes)
+    except policy_extraction.ExtractionError:
+        logger.info("Auto-extraction skipped for %s's submission - not a readable text PDF", client_name)
+        return
+    except Exception:  # noqa: BLE001
+        logger.exception("Auto-extraction failed for %s's submission", client_name)
+        return
+
+    try:
+        await policy_extraction.save_extracted_policy(
+            client_name, fields, pdf_bytes=pdf_bytes, pdf_filename=file_info.get("filename"),
+        )
+        preview_bytes = await policy_workbook.get_client_facing_pdf(client_name)
+    except Exception:  # noqa: BLE001
+        logger.exception("Failed to save extracted policy or build preview for %s", client_name)
+        try:
+            await context.bot.send_message(
+                chat_id=settings.allowed_user_id,
+                text=(
+                    f"⚠️ Auto-extracted {client_name}'s submission but couldn't save it or build the "
+                    "summary — please file it manually via your own bot."
+                ),
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("Could not even notify Nic about the auto-extraction failure for %s", client_name)
+        return
+
+    token = uuid.uuid4().hex[:10]
+    pending_client_approval[token] = client_name
+    keyboard = InlineKeyboardMarkup(
+        [[InlineKeyboardButton(f"✅ Send to {client_name}", callback_data=f"approve_send:{token}")]]
+    )
+    try:
+        await context.bot.send_document(
+            chat_id=settings.allowed_user_id,
+            document=BytesIO(preview_bytes),
+            filename=f"{client_name} - Policy Summary.pdf",
+            caption=(
+                f"Auto-extracted and saved {client_name}'s policy summary from their submission.\n"
+                "Review it, then tap below to send it to them."
+            ),
+            reply_markup=keyboard,
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("Could not send auto-extraction preview + approval button to Nic for %s", client_name)
+
+
+async def handle_approve_send(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Nic-only: fires when he taps the "✅ Send to {client}" button on an
+    auto-extracted policy summary preview. Delivers the client-facing PDF
+    to that client via this same bot's existing chat with them - this is
+    the one and only place a client actually receives the auto-generated
+    summary; nothing sends it to them automatically."""
+    query = update.callback_query
+    if update.effective_user.id != settings.allowed_user_id:
+        await query.answer("Only Nic can approve this.", show_alert=True)
+        return
+
+    token = query.data.split(":", 1)[1]
+    client_name = pending_client_approval.pop(token, None)
+    if not client_name:
+        await query.answer("This approval has expired — resend the document if you need to try again.", show_alert=True)
+        return
+
+    telegram_user_id = await client_pairing.get_telegram_id_for_client(client_name)
+    if telegram_user_id is None:
+        await query.answer(f"Couldn't find {client_name}'s Telegram chat — send it manually.", show_alert=True)
+        return
+
+    try:
+        pdf_bytes = await policy_workbook.get_client_facing_pdf(client_name)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Failed to build client-facing PDF for %s at send time", client_name)
+        await query.answer(f"Couldn't build the PDF: {exc}", show_alert=True)
+        return
+
+    try:
+        await context.bot.send_document(
+            chat_id=telegram_user_id,
+            document=BytesIO(pdf_bytes),
+            filename=f"{client_name} - Policy Summary.pdf",
+            caption=f"Here's your updated policy summary, prepared by {settings.agent_name}.",
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Failed to deliver approved policy summary to %s", client_name)
+        await query.answer(f"Couldn't send it to the client: {exc}", show_alert=True)
+        return
+
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except Exception:  # noqa: BLE001
+        pass
+    await query.answer("Sent!")
+    await query.message.reply_text(f"✅ Sent to {client_name}.")
+
+
+async def handle_channel_join(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Fires when someone's membership status in the Wealth Circle channel
+    changes - including an approved join request. If they joined via one
+    of the named Invite Friends links (services/client_pairing referral
+    links) and aren't already a paired client, marks them as awaiting a
+    name so the next time they message this bot (e.g. via a pinned
+    channel message pointing at it) it can ask for their full name and
+    auto-pair them straight away - see start()/handle_private_text().
+
+    Deliberately does NOT try to DM the new joiner directly here: Telegram
+    does not let a bot message someone who has never started a chat with
+    it, and someone who just joined via a channel invite link usually
+    hasn't. The awaiting-name flag is durable (stored via
+    client_pairing.py, not in-memory) precisely so it survives until
+    whenever they do first message the bot."""
+    cm = update.chat_member
+    if cm is None or settings.client_group_chat_id is None:
+        return
+    if cm.chat.id != settings.client_group_chat_id:
+        return
+
+    old_status = cm.old_chat_member.status
+    new_status = cm.new_chat_member.status
+    if new_status != ChatMember.MEMBER or old_status == ChatMember.MEMBER:
+        return  # only a fresh join, not e.g. an admin-permission change
+
+    user = cm.new_chat_member.user
+    if user.is_bot:
+        return
+
+    invite_link = cm.invite_link
+    referred_by = invite_link.name if invite_link and invite_link.name else None
+    if not referred_by:
+        return  # joined some other way (not a named Invite Friends link) - nothing to auto-pair
+
+    already_paired = await client_pairing.get_paired_client(user.id)
+    if already_paired:
+        return  # already a client somehow - leave their existing pairing alone
+
+    await client_pairing.mark_awaiting_name(user.id, referred_by)
+
+    try:
+        await context.bot.send_message(
+            chat_id=settings.allowed_user_id,
+            text=(
+                f"🆕 Someone joined Wealth Circle via {referred_by}'s invite link. "
+                "I'll auto-pair them once they message me and give their full name."
+            ),
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("Could not notify Nic about new referral join via %s's link", referred_by)
 
 
 # ---------------------------------------------------------------------------
@@ -759,6 +1020,8 @@ def main() -> None:
     app.add_handler(CommandHandler("refer", refer_command))
     app.add_handler(CommandHandler("invite", invite_command))
     app.add_handler(CallbackQueryHandler(meeting_callback, pattern=r"^m(day|slot):"))
+    app.add_handler(CallbackQueryHandler(handle_approve_send, pattern=r"^approve_send:"))
+    app.add_handler(ChatMemberHandler(handle_channel_join, chat_member_types=ChatMemberHandler.CHAT_MEMBER))
     app.add_handler(MessageHandler(filters.FORWARDED & filters.ChatType.PRIVATE, handle_forwarded_message))
     app.add_handler(MessageHandler(filters.TEXT & filters.ChatType.PRIVATE & ~filters.COMMAND, handle_private_text))
     app.add_handler(MessageHandler(

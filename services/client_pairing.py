@@ -55,6 +55,7 @@ async def _load() -> dict:
         return {"pending": {}, "confirmed": {}}
     store.setdefault("pending", {})
     store.setdefault("confirmed", {})
+    store.setdefault("awaiting_name", {})
     return store
 
 
@@ -113,3 +114,55 @@ async def get_paired_client(telegram_user_id: int) -> str | None:
     None if they haven't redeemed a pairing code yet."""
     store = await _load()
     return store["confirmed"].get(str(telegram_user_id))
+
+
+async def get_telegram_id_for_client(client_name: str) -> int | None:
+    """Reverse lookup: given a client_name, finds the Telegram user id
+    they're paired to, if any. Used by the auto-extraction approval flow
+    (client_bot.py) to know where to deliver the finished policy summary
+    PDF. O(n) scan of the confirmed dict - fine at this scale (a handful of
+    paired clients, not thousands)."""
+    store = await _load()
+    for uid, name in store["confirmed"].items():
+        if name == client_name:
+            return int(uid)
+    return None
+
+
+async def pair_directly(telegram_user_id: int, client_name: str) -> None:
+    """Pairs telegram_user_id straight to client_name, with no code to
+    redeem - used once a brand-new referred joiner (see mark_awaiting_name
+    below) has told the client bot their full name."""
+    store = await _load()
+    store["confirmed"][str(telegram_user_id)] = client_name
+    await _save(store)
+
+
+async def mark_awaiting_name(telegram_user_id: int, referred_by: str | None) -> None:
+    """Marks a Telegram user as a brand-new prospect who just joined the
+    Wealth Circle channel via a named Invite Friends link, and needs to
+    supply their full name before they can be auto-paired to a fresh
+    client record. Picked up in client_bot.py's start()/handle_private_text()
+    the next time this user messages the bot - Telegram doesn't allow a bot
+    to DM someone who hasn't started a chat with it first, so this can't be
+    prompted immediately at join time; it's a durable flag checked on their
+    next message instead."""
+    store = await _load()
+    store["awaiting_name"][str(telegram_user_id)] = {
+        "referred_by": referred_by,
+        "marked_at": _now().isoformat(),
+    }
+    await _save(store)
+
+
+async def get_awaiting_name(telegram_user_id: int) -> dict | None:
+    """Returns the {referred_by, marked_at} entry if this Telegram user is
+    mid-way through the auto-pair-a-referral flow, else None."""
+    store = await _load()
+    return store["awaiting_name"].get(str(telegram_user_id))
+
+
+async def clear_awaiting_name(telegram_user_id: int) -> None:
+    store = await _load()
+    store["awaiting_name"].pop(str(telegram_user_id), None)
+    await _save(store)
