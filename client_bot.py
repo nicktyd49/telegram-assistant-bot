@@ -66,6 +66,14 @@ WORK_END_HOUR = 21
 MEETING_SLOT_MINUTES = 60
 BOOKING_LOOKAHEAD_DAYS = 7
 
+# Minimum gap Nic wants left free between any two appointments, to account
+# for travel time between them. Applied as a full MEETING_BUFFER_MINUTES
+# pad on BOTH sides of every existing appointment (not split/halved) in
+# _free_slots() below - a freshly-offered slot has no padding of its own
+# yet, so only padding the existing appointment fully on both sides
+# guarantees the real gap to it is never less than MEETING_BUFFER_MINUTES.
+MEETING_BUFFER_MINUTES = 60
+
 MENU_RETRIEVE = "📄 Retrieve Policy"
 MENU_SUMMARY = "📋 Policy Summary"
 MENU_SUBMIT = "📤 Submit a Document"
@@ -845,10 +853,14 @@ async def handle_channel_join(update: Update, context: ContextTypes.DEFAULT_TYPE
 def _free_slots(events: list[dict], day: date) -> list[tuple[datetime, datetime]]:
     """Gaps of at least MEETING_SLOT_MINUTES between events, clamped to the
     business-hours window for that day, chopped into fixed-length chunks a
-    client can pick as one button."""
+    client can pick as one button. Each event is padded by the full
+    MEETING_BUFFER_MINUTES on both sides first, so an offered slot is
+    always at least MEETING_BUFFER_MINUTES of travel time away from any
+    existing appointment."""
     tz = ZoneInfo(settings.timezone)
     window_start = datetime.combine(day, dt_time(WORK_START_HOUR, 0), tzinfo=tz)
     window_end = datetime.combine(day, dt_time(WORK_END_HOUR, 0), tzinfo=tz)
+    buffer = timedelta(minutes=MEETING_BUFFER_MINUTES)
 
     busy = []
     for e in events:
@@ -857,8 +869,8 @@ def _free_slots(events: list[dict], day: date) -> list[tuple[datetime, datetime]
         if not s or not en:
             continue
         try:
-            s_dt = datetime.fromisoformat(s)
-            e_dt = datetime.fromisoformat(en)
+            s_dt = datetime.fromisoformat(s) - buffer
+            e_dt = datetime.fromisoformat(en) + buffer
         except ValueError:
             continue
         s_dt = max(s_dt, window_start)

@@ -246,13 +246,27 @@ def _week_range(today: date) -> tuple[str, str]:
     return start.isoformat(), end.isoformat()
 
 
+# Minimum gap Nic wants left free between any two appointments, to account
+# for travel time between them. Applied as a full MEETING_BUFFER_MINUTES
+# pad on BOTH sides of every existing appointment (not split/halved) - a
+# freshly-offered slot has no padding of its own yet, so only padding the
+# existing appointment fully on both sides guarantees the real gap to it
+# is never less than MEETING_BUFFER_MINUTES.
+MEETING_BUFFER_MINUTES = 60
+
+
 def _free_slots(events: list[dict], day: date) -> list[str]:
     """Gaps of at least 30 minutes between events, clamped to the configured
     business-hours window for that day. All-day events are ignored here since
-    they don't have a specific time range to carve out."""
+    they don't have a specific time range to carve out. Each event is padded
+    by half of MEETING_BUFFER_MINUTES on both sides before gaps are computed,
+    so a slot right up against an existing appointment is never offered -
+    there's always at least MEETING_BUFFER_MINUTES of travel time between
+    any two bookings."""
     tz = ZoneInfo(settings.timezone)
     window_start = datetime.combine(day, dt_time(WORK_START_HOUR, 0), tzinfo=tz)
     window_end = datetime.combine(day, dt_time(WORK_END_HOUR, 0), tzinfo=tz)
+    buffer = timedelta(minutes=MEETING_BUFFER_MINUTES)
 
     busy = []
     for e in events:
@@ -261,8 +275,8 @@ def _free_slots(events: list[dict], day: date) -> list[str]:
         if not s or not en:
             continue
         try:
-            s_dt = datetime.fromisoformat(s)
-            e_dt = datetime.fromisoformat(en)
+            s_dt = datetime.fromisoformat(s) - buffer
+            e_dt = datetime.fromisoformat(en) + buffer
         except ValueError:
             continue
         s_dt = max(s_dt, window_start)
