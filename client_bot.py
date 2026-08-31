@@ -107,9 +107,14 @@ def _menu_keyboard(paired: bool) -> ReplyKeyboardMarkup:
             [[MENU_RETRIEVE, MENU_SUMMARY], [MENU_SUBMIT, MENU_REFER], [MENU_BOOK, MENU_HELP]],
             resize_keyboard=True,
         )
-    # Booking and referring a friend don't need pairing - show them even
-    # before/without one.
-    return ReplyKeyboardMarkup([[MENU_REFER], [MENU_BOOK], [MENU_HELP]], resize_keyboard=True)
+    # Booking and referring a friend don't need pairing, and Policy Summary
+    # is shown too even though it does need pairing - tapping it before
+    # pairing just explains that a code is needed (send_policy_summary_text
+    # already handles that), rather than hiding the button and leaving a
+    # client with no way to discover the feature exists at all.
+    return ReplyKeyboardMarkup(
+        [[MENU_SUMMARY], [MENU_REFER], [MENU_BOOK], [MENU_HELP]], resize_keyboard=True,
+    )
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
