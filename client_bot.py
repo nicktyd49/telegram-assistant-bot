@@ -199,11 +199,11 @@ async def handle_private_text(update: Update, context: ContextTypes.DEFAULT_TYPE
         if existing:
             pending_submission[user_id] = {"details": None, "file": None}
             await update.message.reply_text(
-                "Before you send it — please make sure your personal details (name, NRIC/policy number, "
-                "date of birth) are fully visible and not cropped out of the document.\n\n"
-                "Also reply here with your full Name and Date of Birth, so it doesn't hold up your policy "
-                "summary. You can send the document and your details in any order — I'll pass everything "
-                f"to {settings.agent_name} once I have both."
+                "Before you send it — for your privacy (PDPA), please crop out or black out your personal "
+                "details (e.g. NRIC number, address, signature) from the document first.\n\n"
+                "That's also why I need your full Name and Date of Birth here as text separately, so it "
+                "doesn't hold up your policy summary. You can send the document and your details in any "
+                f"order — I'll pass everything to {settings.agent_name} once I have both."
             )
         else:
             await update.message.reply_text(
@@ -391,9 +391,10 @@ async def handle_private_submission(update: Update, context: ContextTypes.DEFAUL
     here at any time, whether or not they tapped Submit a Document first.
     Holds it in pending_submission until their Name/DOB details are also
     collected (see _handle_submission_details), then relays both to Nic
-    together via _finish_submission — this way a document with personal
-    details accidentally cropped out still comes with reliable Name/DOB
-    text, instead of Nic having to chase it down separately."""
+    together via _finish_submission — clients are asked to crop/black out
+    their personal details from the document itself (PDPA), so this is what
+    supplies reliable Name/DOB text instead of Nic having to chase it down
+    separately."""
     if not _is_private(update):
         return
     message = update.message
@@ -422,8 +423,8 @@ async def handle_private_submission(update: Update, context: ContextTypes.DEFAUL
 
     await message.reply_text(
         "Got the document — one more thing: please reply here with your full Name and Date of Birth "
-        "so it doesn't hold up your policy summary. And double check your personal details weren't "
-        "cropped out of what you just sent."
+        "so it doesn't hold up your policy summary. And if you haven't already, please make sure your "
+        "personal details (e.g. NRIC number, address) were cropped or blacked out of what you just sent."
     )
 
 
@@ -447,7 +448,7 @@ async def _handle_submission_details(update: Update, context: ContextTypes.DEFAU
 
     await update.message.reply_text(
         "Got it, thanks. Go ahead and attach the document whenever you're ready — "
-        "just make sure your personal details aren't cropped out."
+        "just make sure your personal details (e.g. NRIC number, address) are cropped or blacked out first."
     )
 
 
