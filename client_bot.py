@@ -64,7 +64,12 @@ logger = logging.getLogger("client-bot")
 WORK_START_HOUR = 9
 WORK_END_HOUR = 21
 MEETING_SLOT_MINUTES = 60
-BOOKING_LOOKAHEAD_DAYS = 7
+# Widened from 7 to 14 days, weekends included, at Nic's request - the day
+# picker used to run out of dates (and skipped Sat/Sun) too soon for clients
+# who wanted to book further out. Paginated (see DAYS_PER_PAGE) rather than
+# listed as one long button stack, per Nic's "use arrow key" preference.
+BOOKING_LOOKAHEAD_DAYS = 14
+DAYS_PER_PAGE = 5
 
 # Minimum gap Nic wants left free between any two appointments, to account
 # for travel time between them. Applied as a full MEETING_BUFFER_MINUTES
@@ -898,6 +903,28 @@ def _free_slots(events: list[dict], day: date) -> list[tuple[datetime, datetime]
     return slots
 
 
+def _day_picker_buttons(today: date, page: int) -> list:
+    """One page of day buttons (DAYS_PER_PAGE at a time) covering the next
+    BOOKING_LOOKAHEAD_DAYS days, plus a nav row with 'Earlier'/'Later'
+    arrows where there's another page in that direction. Weekends are
+    included - Nic takes client meetings then too."""
+    all_days = [today + timedelta(days=i) for i in range(1, BOOKING_LOOKAHEAD_DAYS + 1)]
+    start = page * DAYS_PER_PAGE
+    page_days = all_days[start:start + DAYS_PER_PAGE]
+    buttons = [
+        [InlineKeyboardButton(day.strftime("%a %d %b"), callback_data=f"mday:{day.isoformat()}")]
+        for day in page_days
+    ]
+    nav_row = []
+    if page > 0:
+        nav_row.append(InlineKeyboardButton("◀ Earlier", callback_data=f"mpage:{page - 1}"))
+    if start + DAYS_PER_PAGE < len(all_days):
+        nav_row.append(InlineKeyboardButton("Later ▶", callback_data=f"mpage:{page + 1}"))
+    if nav_row:
+        buttons.append(nav_row)
+    return buttons
+
+
 async def start_booking(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_private(update):
         return
@@ -908,13 +935,8 @@ async def start_booking(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
     tz = ZoneInfo(settings.timezone)
     today = datetime.now(tz).date()
-    buttons = []
-    for i in range(1, BOOKING_LOOKAHEAD_DAYS + 1):
-        day = today + timedelta(days=i)
-        if day.weekday() >= 5:  # skip Sat/Sun
-            continue
-        buttons.append([InlineKeyboardButton(day.strftime("%a %d %b"), callback_data=f"mday:{day.isoformat()}")])
-    pending_meeting[update.effective_user.id] = {"step": "choose_day"}
+    buttons = _day_picker_buttons(today, page=0)
+    pending_meeting[update.effective_user.id] = {"step": "choose_day", "page": 0}
     await update.message.reply_text("Which day works for you?", reply_markup=InlineKeyboardMarkup(buttons))
 
 
@@ -932,6 +954,16 @@ async def meeting_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     await query.answer()
 
     data = query.data
+    if data.startswith("mpage:"):
+        page = int(data.split(":", 1)[1])
+        tz = ZoneInfo(settings.timezone)
+        today = datetime.now(tz).date()
+        buttons = _day_picker_buttons(today, page)
+        session["step"] = "choose_day"
+        session["page"] = page
+        await query.edit_message_text("Which day works for you?", reply_markup=InlineKeyboardMarkup(buttons))
+        return
+
     if data.startswith("mday:"):
         day_iso = data.split(":", 1)[1]
         day = date.fromisoformat(day_iso)
