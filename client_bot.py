@@ -1063,7 +1063,7 @@ def main() -> None:
     app.add_handler(CommandHandler("book_meeting", book_meeting_command))
     app.add_handler(CommandHandler("refer", refer_command))
     app.add_handler(CommandHandler("invite", invite_command))
-    app.add_handler(CallbackQueryHandler(meeting_callback, pattern=r"^m(day|slot):"))
+    app.add_handler(CallbackQueryHandler(meeting_callback, pattern=r"^m(day|slot|page):"))
     app.add_handler(CallbackQueryHandler(handle_approve_send, pattern=r"^approve_send:"))
     app.add_handler(ChatMemberHandler(handle_channel_join, chat_member_types=ChatMemberHandler.CHAT_MEMBER))
     app.add_handler(MessageHandler(filters.FORWARDED & filters.ChatType.PRIVATE, handle_forwarded_message))
