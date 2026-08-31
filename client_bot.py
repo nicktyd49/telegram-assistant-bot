@@ -87,6 +87,14 @@ pending_meeting: dict[int, dict] = {}
 # reasoning as booking - referring a friend isn't sensitive.
 pending_referral: dict[int, bool] = {}
 
+# Document-submission state, keyed by Telegram user id: holds whatever of
+# {file, Name/DOB details} has arrived so far, since a client may attach
+# the document and reply with their details in either order. Only ever
+# created for paired clients (see handle_private_submission /
+# handle_private_text's MENU_SUBMIT branch) - unlike booking/referral this
+# stays pairing-gated the whole way through.
+pending_submission: dict[int, dict] = {}
+
 
 def _client_label(user) -> str:
     """Best-effort human-readable label for a Telegram user, used when the
@@ -168,6 +176,10 @@ async def handle_private_text(update: Update, context: ContextTypes.DEFAULT_TYPE
         await _handle_referral_reply(update, context, text)
         return
 
+    if user_id in pending_submission and text not in MENU_TEXTS:
+        await _handle_submission_details(update, context, text)
+        return
+
     if text == MENU_BOOK:
         await start_booking(update, context)
         return
@@ -185,7 +197,14 @@ async def handle_private_text(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
     if text == MENU_SUBMIT:
         if existing:
-            await update.message.reply_text("Go ahead and send me the document — just attach it here.")
+            pending_submission[user_id] = {"details": None, "file": None}
+            await update.message.reply_text(
+                "Before you send it — please make sure your personal details (name, NRIC/policy number, "
+                "date of birth) are fully visible and not cropped out of the document.\n\n"
+                "Also reply here with your full Name and Date of Birth, so it doesn't hold up your policy "
+                "summary. You can send the document and your details in any order — I'll pass everything "
+                f"to {settings.agent_name} once I have both."
+            )
         else:
             await update.message.reply_text(
                 "I need a one-time pairing code from your agent before I can pass along documents."
@@ -368,10 +387,13 @@ async def _handle_referral_reply(update: Update, context: ContextTypes.DEFAULT_T
 
 
 async def handle_private_submission(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """DM-only, paired clients only: relays a document/photo straight to Nic,
-    tagged with the client's real name, and confirms to the client it went
-    through. Nic reviews/files it himself the same way he already does
-    (his own bot's PDF-logging flow) - this just gets it to him."""
+    """DM-only, paired clients only: a client can attach a document/photo
+    here at any time, whether or not they tapped Submit a Document first.
+    Holds it in pending_submission until their Name/DOB details are also
+    collected (see _handle_submission_details), then relays both to Nic
+    together via _finish_submission — this way a document with personal
+    details accidentally cropped out still comes with reliable Name/DOB
+    text, instead of Nic having to chase it down separately."""
     if not _is_private(update):
         return
     message = update.message
@@ -384,30 +406,91 @@ async def handle_private_submission(update: Update, context: ContextTypes.DEFAUL
         )
         return
 
-    label = client_name or _client_label(update.effective_user)
-    try:
-        if message.document:
-            await context.bot.send_document(
-                chat_id=settings.allowed_user_id,
-                document=message.document.file_id,
-                caption=f"📎 {label} submitted a document via the client bot"
-                + (f":\n{message.caption}" if message.caption else ""),
-            )
-        elif message.photo:
-            await context.bot.send_photo(
-                chat_id=settings.allowed_user_id,
-                photo=message.photo[-1].file_id,
-                caption=f"📷 {label} submitted a photo via the client bot"
-                + (f":\n{message.caption}" if message.caption else ""),
-            )
-        else:
-            return
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("Failed to relay submission from %s to Nic", label)
-        await message.reply_text(f"Sorry, that didn't go through: {exc}. Please try again in a moment.")
+    if message.document:
+        file_info = {"kind": "document", "file_id": message.document.file_id, "caption": message.caption}
+    elif message.photo:
+        file_info = {"kind": "photo", "file_id": message.photo[-1].file_id, "caption": message.caption}
+    else:
         return
 
-    await message.reply_text(f"Sent to {settings.agent_name} — thanks!")
+    entry = pending_submission.setdefault(user_id, {"details": None, "file": None})
+    entry["file"] = file_info
+
+    if entry["details"]:
+        await _finish_submission(update, context, user_id, client_name)
+        return
+
+    await message.reply_text(
+        "Got the document — one more thing: please reply here with your full Name and Date of Birth "
+        "so it doesn't hold up your policy summary. And double check your personal details weren't "
+        "cropped out of what you just sent."
+    )
+
+
+async def _handle_submission_details(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+    """Handles a free-text reply while pending_submission is open for this
+    user — treated as their Name/DOB. Finishes the submission immediately
+    if the document already came in, otherwise just holds the details and
+    waits for it."""
+    user_id = update.effective_user.id
+    client_name = await client_pairing.get_paired_client(user_id)
+    if not client_name:
+        pending_submission.pop(user_id, None)
+        return
+
+    entry = pending_submission.setdefault(user_id, {"details": None, "file": None})
+    entry["details"] = text
+
+    if entry["file"]:
+        await _finish_submission(update, context, user_id, client_name)
+        return
+
+    await update.message.reply_text(
+        "Got it, thanks. Go ahead and attach the document whenever you're ready — "
+        "just make sure your personal details aren't cropped out."
+    )
+
+
+async def _finish_submission(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int, client_name: str) -> None:
+    """Sends the held file to Nic with the client's typed Name/DOB folded
+    into the caption, then clears the pending state and confirms to the
+    client it went through."""
+    entry = pending_submission.pop(user_id, None)
+    if not entry or not entry.get("file"):
+        return
+
+    file_info = entry["file"]
+    details = entry.get("details")
+    label = client_name or _client_label(update.effective_user)
+    kind_label = "document" if file_info["kind"] == "document" else "photo"
+    kind_emoji = "📎" if file_info["kind"] == "document" else "📷"
+
+    caption_lines = [f"{kind_emoji} {label} submitted a {kind_label} via the client bot"]
+    if details:
+        caption_lines.append(f"Name/DOB provided: {details}")
+    if file_info.get("caption"):
+        caption_lines.append(file_info["caption"])
+    caption = "\n".join(caption_lines)
+
+    try:
+        if file_info["kind"] == "document":
+            await context.bot.send_document(
+                chat_id=settings.allowed_user_id,
+                document=file_info["file_id"],
+                caption=caption,
+            )
+        else:
+            await context.bot.send_photo(
+                chat_id=settings.allowed_user_id,
+                photo=file_info["file_id"],
+                caption=caption,
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Failed to relay submission from %s to Nic", label)
+        await update.message.reply_text(f"Sorry, that didn't go through: {exc}. Please try again in a moment.")
+        return
+
+    await update.message.reply_text(f"Sent to {settings.agent_name} — thanks!")
 
 
 # ---------------------------------------------------------------------------
