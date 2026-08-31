@@ -107,13 +107,17 @@ def _menu_keyboard(paired: bool) -> ReplyKeyboardMarkup:
             [[MENU_RETRIEVE, MENU_SUMMARY], [MENU_SUBMIT, MENU_REFER], [MENU_BOOK, MENU_HELP]],
             resize_keyboard=True,
         )
-    # Booking and referring a friend don't need pairing, and Policy Summary
-    # is shown too even though it does need pairing - tapping it before
-    # pairing just explains that a code is needed (send_policy_summary_text
-    # already handles that), rather than hiding the button and leaving a
-    # client with no way to discover the feature exists at all.
+    # Booking and referring a friend don't need pairing. Retrieve Policy and
+    # Policy Summary are shown too even though both need pairing - tapping
+    # either before pairing just explains that a code is needed
+    # (send_policy_pdf / send_policy_summary_text already handle that),
+    # rather than hiding the buttons and leaving a client with no way to
+    # discover the features exist at all. Submit a Document stays hidden
+    # pre-pairing - unlike the two read-only buttons above, sending Nic an
+    # unsolicited document from an unlinked account isn't something to
+    # invite before he knows who it's from.
     return ReplyKeyboardMarkup(
-        [[MENU_SUMMARY], [MENU_REFER], [MENU_BOOK], [MENU_HELP]], resize_keyboard=True,
+        [[MENU_RETRIEVE, MENU_SUMMARY], [MENU_REFER], [MENU_BOOK], [MENU_HELP]], resize_keyboard=True,
     )
 
 
