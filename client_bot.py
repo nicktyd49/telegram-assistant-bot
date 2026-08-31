@@ -68,12 +68,13 @@ MENU_RETRIEVE = "📄 Retrieve Policy"
 MENU_SUMMARY = "📋 Policy Summary"
 MENU_SUBMIT = "📤 Submit a Document"
 MENU_REFER = "🤝 Refer a Friend"
+MENU_INVITE = "🔗 Invite Friends"
 MENU_BOOK = "📅 Book a Meeting"
 MENU_HELP = "❓ Help"
 
 # Every menu button label, used to tell a real menu tap apart from free
 # text typed while some other pending state (e.g. a referral) is open.
-MENU_TEXTS = {MENU_RETRIEVE, MENU_SUMMARY, MENU_SUBMIT, MENU_REFER, MENU_BOOK, MENU_HELP}
+MENU_TEXTS = {MENU_RETRIEVE, MENU_SUMMARY, MENU_SUBMIT, MENU_REFER, MENU_INVITE, MENU_BOOK, MENU_HELP}
 
 # Meeting-booking state, keyed by Telegram user id (every user books their
 # own meeting independently - no chat_id collisions to worry about since
@@ -95,6 +96,13 @@ pending_referral: dict[int, bool] = {}
 # stays pairing-gated the whole way through.
 pending_submission: dict[int, dict] = {}
 
+# Per-client Wealth Circle invite links, keyed by client_name. A repeat tap
+# of Invite Friends reuses the same link instead of minting a new one every
+# time. Lost on restart like the rest of this bot's state - the next tap
+# after a restart just mints a fresh link, which is harmless (just one more
+# named link sitting in the channel's admin panel).
+client_invite_links: dict[str, str] = {}
+
 
 def _client_label(user) -> str:
     """Best-effort human-readable label for a Telegram user, used when the
@@ -112,7 +120,7 @@ def _is_private(update: Update) -> bool:
 def _menu_keyboard(paired: bool) -> ReplyKeyboardMarkup:
     if paired:
         return ReplyKeyboardMarkup(
-            [[MENU_RETRIEVE, MENU_SUMMARY], [MENU_SUBMIT, MENU_REFER], [MENU_BOOK, MENU_HELP]],
+            [[MENU_RETRIEVE, MENU_SUMMARY], [MENU_SUBMIT, MENU_REFER], [MENU_INVITE, MENU_BOOK], [MENU_HELP]],
             resize_keyboard=True,
         )
     # Booking and referring a friend don't need pairing. Retrieve Policy and
@@ -120,10 +128,11 @@ def _menu_keyboard(paired: bool) -> ReplyKeyboardMarkup:
     # either before pairing just explains that a code is needed
     # (send_policy_pdf / send_policy_summary_text already handle that),
     # rather than hiding the buttons and leaving a client with no way to
-    # discover the features exist at all. Submit a Document stays hidden
-    # pre-pairing - unlike the two read-only buttons above, sending Nic an
-    # unsolicited document from an unlinked account isn't something to
-    # invite before he knows who it's from.
+    # discover the features exist at all. Submit a Document and Invite
+    # Friends stay hidden pre-pairing - unlike the two read-only buttons
+    # above, sending Nic an unsolicited document, or minting a named invite
+    # link tied to an unknown identity, isn't something to invite before he
+    # knows who it's from.
     return ReplyKeyboardMarkup(
         [[MENU_RETRIEVE, MENU_SUMMARY], [MENU_REFER], [MENU_BOOK], [MENU_HELP]], resize_keyboard=True,
     )
@@ -209,6 +218,9 @@ async def handle_private_text(update: Update, context: ContextTypes.DEFAULT_TYPE
             await update.message.reply_text(
                 "I need a one-time pairing code from your agent before I can pass along documents."
             )
+        return
+    if text == MENU_INVITE:
+        await send_invite_link(update, context)
         return
     if text == MENU_HELP:
         await help_command(update, context)
@@ -384,6 +396,76 @@ async def _handle_referral_reply(update: Update, context: ContextTypes.DEFAULT_T
         return
 
     await update.message.reply_text(f"Thanks! I've passed that along to {settings.agent_name}.")
+
+
+async def send_invite_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """DM-only, paired clients only: mints (or reuses) a personal invite
+    link to Nic's client channel, named after the client, with join
+    requests turned on. That does two things at once: friends who tap it
+    need Nic's approval before they're actually let in, and because the
+    link is named per-client, he can tell who invited someone when he
+    reviews that approval - without a single shared link that can't be
+    attributed to anyone."""
+    if not _is_private(update):
+        return
+    user_id = update.effective_user.id
+    client_name = await client_pairing.get_paired_client(user_id)
+    if not client_name:
+        await update.message.reply_text(
+            "I need a one-time pairing code from your agent before I can give you an invite link."
+        )
+        return
+
+    if not settings.client_group_chat_id:
+        logger.error("Invite Friends tapped but CLIENT_GROUP_CHAT_ID isn't configured.")
+        await update.message.reply_text("Invite links aren't set up yet — let your agent know.")
+        return
+
+    link = client_invite_links.get(client_name)
+    if not link:
+        try:
+            invite = await context.bot.create_chat_invite_link(
+                chat_id=settings.client_group_chat_id,
+                name=client_name[:32],
+                creates_join_request=True,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Failed to create an invite link for %s", client_name)
+            await update.message.reply_text(f"Sorry, that didn't work: {exc}. Please try again in a moment.")
+            return
+        link = invite.invite_link
+        client_invite_links[client_name] = link
+
+    await update.message.reply_text(
+        "Here's your personal invite link — feel free to share it with friends who might be interested:\n\n"
+        f"{link}\n\n"
+        f"When someone taps it, they'll need {settings.agent_name}'s approval to join (usually quick), "
+        "and since this link is yours, he'll know it came through you."
+    )
+
+
+async def invite_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await send_invite_link(update, context)
+
+
+async def handle_forwarded_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """DM-only, Nic only: forward any message from a channel or group here
+    to get its chat ID back. This is the easiest way to find
+    CLIENT_GROUP_CHAT_ID (needed for Invite Friends, and for PA's own
+    "post to client group" button) without relying on a command posted
+    inside the chat itself."""
+    if not _is_private(update):
+        return
+    if update.effective_user.id != settings.allowed_user_id:
+        return
+    origin = update.message.forward_origin
+    chat = getattr(origin, "chat", None) if origin else None
+    if chat is None:
+        return
+    await update.message.reply_text(
+        f"That's from: {chat.title or chat.id}\nChat ID: {chat.id}\n\n"
+        "Set CLIENT_GROUP_CHAT_ID to this on Railway to enable Invite Friends."
+    )
 
 
 async def handle_private_submission(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -650,7 +732,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             "- Show a quick text summary of your policies (needs a pairing code from your agent)\n"
             "- Send your full policy summary as a PDF (also needs pairing)\n"
             "- Pass along a document you send me straight to your agent (also needs pairing)\n"
-            "- Refer a friend — no pairing needed, just /refer\n\n"
+            "- Refer a friend — no pairing needed, just /refer\n"
+            "- Give you a personal invite link to share with friends (needs pairing), just /invite\n\n"
             "Use the menu below any time."
         )
     else:
@@ -674,7 +757,9 @@ def main() -> None:
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("book_meeting", book_meeting_command))
     app.add_handler(CommandHandler("refer", refer_command))
+    app.add_handler(CommandHandler("invite", invite_command))
     app.add_handler(CallbackQueryHandler(meeting_callback, pattern=r"^m(day|slot):"))
+    app.add_handler(MessageHandler(filters.FORWARDED & filters.ChatType.PRIVATE, handle_forwarded_message))
     app.add_handler(MessageHandler(filters.TEXT & filters.ChatType.PRIVATE & ~filters.COMMAND, handle_private_text))
     app.add_handler(MessageHandler(
         (filters.Document.ALL | filters.PHOTO) & filters.ChatType.PRIVATE, handle_private_submission,
