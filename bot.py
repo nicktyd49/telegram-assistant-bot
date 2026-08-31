@@ -248,8 +248,12 @@ def _week_range(today: date) -> tuple[str, str]:
 
 def _free_slots(events: list[dict], day: date) -> list[str]:
     """Gaps of at least 30 minutes between events, clamped to the configured
-    business-hours window for that day. All-day events are ignored here since
-    they don't have a specific time range to carve out."""
+    business-hours window for that day. An all-day event (no dateTime, just
+    a date - e.g. blocking out a whole day for a roadshow or external
+    training without picking exact hours) blocks the ENTIRE window for that
+    day, same as if it were fully booked - previously these were silently
+    ignored, which meant a day Nic had marked out with an all-day entry
+    still showed every hour as bookable."""
     tz = ZoneInfo(settings.timezone)
     window_start = datetime.combine(day, dt_time(WORK_START_HOUR, 0), tzinfo=tz)
     window_end = datetime.combine(day, dt_time(WORK_END_HOUR, 0), tzinfo=tz)
@@ -259,6 +263,8 @@ def _free_slots(events: list[dict], day: date) -> list[str]:
         s = e.get("start", {}).get("dateTime")
         en = e.get("end", {}).get("dateTime")
         if not s or not en:
+            if e.get("start", {}).get("date"):
+                return []  # all-day event on this day - treat the whole day as blocked
             continue
         try:
             s_dt = datetime.fromisoformat(s)
