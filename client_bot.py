@@ -34,6 +34,7 @@ Setup checklist (see /client_code in bot.py + README):
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import date, datetime, timedelta, time as dt_time
 from io import BytesIO
@@ -63,10 +64,16 @@ WORK_END_HOUR = 21
 MEETING_SLOT_MINUTES = 60
 BOOKING_LOOKAHEAD_DAYS = 7
 
-MENU_POLICY = "📄 My Policy Summary"
+MENU_RETRIEVE = "📄 Retrieve Policy"
+MENU_SUMMARY = "📋 Policy Summary"
 MENU_SUBMIT = "📤 Submit a Document"
+MENU_REFER = "🤝 Refer a Friend"
 MENU_BOOK = "📅 Book a Meeting"
 MENU_HELP = "❓ Help"
+
+# Every menu button label, used to tell a real menu tap apart from free
+# text typed while some other pending state (e.g. a referral) is open.
+MENU_TEXTS = {MENU_RETRIEVE, MENU_SUMMARY, MENU_SUBMIT, MENU_REFER, MENU_BOOK, MENU_HELP}
 
 # Meeting-booking state, keyed by Telegram user id (every user books their
 # own meeting independently - no chat_id collisions to worry about since
@@ -74,6 +81,11 @@ MENU_HELP = "❓ Help"
 # principle, matching the rest of this bot). Lost on restart, which just
 # means an interrupted booking has to be restarted - nothing destructive.
 pending_meeting: dict[int, dict] = {}
+
+# Referral state, keyed by Telegram user id: True while waiting for the
+# client to reply with a friend's name/number. Not pairing-gated, same
+# reasoning as booking - referring a friend isn't sensitive.
+pending_referral: dict[int, bool] = {}
 
 
 def _client_label(user) -> str:
@@ -92,10 +104,12 @@ def _is_private(update: Update) -> bool:
 def _menu_keyboard(paired: bool) -> ReplyKeyboardMarkup:
     if paired:
         return ReplyKeyboardMarkup(
-            [[MENU_POLICY], [MENU_SUBMIT], [MENU_BOOK, MENU_HELP]], resize_keyboard=True,
+            [[MENU_RETRIEVE, MENU_SUMMARY], [MENU_SUBMIT, MENU_REFER], [MENU_BOOK, MENU_HELP]],
+            resize_keyboard=True,
         )
-    # Booking doesn't need pairing - show it even before/without one.
-    return ReplyKeyboardMarkup([[MENU_BOOK], [MENU_HELP]], resize_keyboard=True)
+    # Booking and referring a friend don't need pairing - show them even
+    # before/without one.
+    return ReplyKeyboardMarkup([[MENU_REFER], [MENU_BOOK], [MENU_HELP]], resize_keyboard=True)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -138,14 +152,27 @@ async def handle_private_text(update: Update, context: ContextTypes.DEFAULT_TYPE
     text = (update.message.text or "").strip()
     user_id = update.effective_user.id
 
+    # A pending referral takes priority over everything except tapping a
+    # real menu button (so a client can back out of it by just tapping
+    # elsewhere instead of getting stuck).
+    if user_id in pending_referral and text not in MENU_TEXTS:
+        await _handle_referral_reply(update, context, text)
+        return
+
     if text == MENU_BOOK:
         await start_booking(update, context)
+        return
+    if text == MENU_REFER:
+        await start_referral(update, context)
         return
 
     existing = await client_pairing.get_paired_client(user_id)
 
-    if text == MENU_POLICY:
-        await send_policy_summary(update, context)
+    if text == MENU_RETRIEVE:
+        await send_policy_pdf(update, context)
+        return
+    if text == MENU_SUMMARY:
+        await send_policy_summary_text(update, context)
         return
     if text == MENU_SUBMIT:
         if existing:
@@ -175,7 +202,7 @@ async def handle_private_text(update: Update, context: ContextTypes.DEFAULT_TYPE
     await update.message.reply_text("Use the menu below.", reply_markup=_menu_keyboard(paired=bool(existing)))
 
 
-async def send_policy_summary(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def send_policy_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_private(update):
         return
     user_id = update.effective_user.id
@@ -203,6 +230,132 @@ async def send_policy_summary(update: Update, context: ContextTypes.DEFAULT_TYPE
         filename=f"{safe_name} - Policy Summary.pdf",
         caption=f"Your current policy summary, prepared by {settings.agent_name}.",
     )
+
+
+def _fmt_money(value, decimals: int = 2):
+    # Duplicated from bot.py's own _fmt_money rather than imported - see the
+    # module docstring on why this file stays fully separate from bot.py.
+    if value in (None, ""):
+        return None
+    if isinstance(value, (int, float)):
+        return f"${value:,.{decimals}f}"
+    return str(value)
+
+
+def _format_client_facing_summary(summary: dict) -> str:
+    # A trimmed version of bot.py's _format_client_summary: same policy/
+    # coverage/premium numbers, but deliberately WITHOUT action_items -
+    # those are Nic's own sales-facing next-step notes ("recommend adding
+    # CI cover"), not copy that should go straight to the client.
+    lines = [summary["client_name"]]
+    policies = summary.get("policies") or []
+    if not policies:
+        lines.append("")
+        lines.append("No policies logged yet.")
+        return "\n".join(lines)
+
+    lines.append("")
+    lines.append(f"{len(policies)} polic{'y' if len(policies) == 1 else 'ies'}:")
+    for p in policies:
+        company = p.get("company") or "?"
+        plan = p.get("plan_type") or "Plan"
+        lines.append(f"\n• {company} — {plan}")
+        if p.get("policy_no"):
+            lines.append(f"  {p['policy_no']}")
+        premium_cash = _fmt_money(p.get("premium_cash"))
+        premium_cpf = _fmt_money(p.get("premium_cpf"))
+        premium_bits = [f"{v} cash" if k == "cash" else f"{v} CPF"
+                         for k, v in (("cash", premium_cash), ("cpf", premium_cpf)) if v]
+        if premium_bits:
+            lines.append(f"  Premium: {' + '.join(premium_bits)}/yr")
+        death_cov = _fmt_money(p.get("death_coverage"), 0)
+        ci_cov = _fmt_money(p.get("ci_coverage"), 0)
+        coverage_bits = [f"Death {death_cov}" if death_cov else None, f"CI {ci_cov}" if ci_cov else None]
+        coverage_bits = [b for b in coverage_bits if b]
+        if coverage_bits:
+            lines.append(f"  Coverage: {', '.join(coverage_bits)}")
+
+    totals = summary.get("totals") or {}
+    total_cash = _fmt_money(totals.get("premium_cash"))
+    total_cpf = _fmt_money(totals.get("premium_cpf"))
+    total_bits = [f"{v} cash" if k == "cash" else f"{v} CPF"
+                   for k, v in (("cash", total_cash), ("cpf", total_cpf)) if v]
+    if total_bits:
+        lines.append(f"\nTotal annual premium: {' + '.join(total_bits)}")
+
+    return "\n".join(lines)
+
+
+async def send_policy_summary_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # The fast, no-file version of send_policy_pdf: same underlying data
+    # (services/policy_workbook.get_client_summary), just formatted as a
+    # quick chat message instead of a PDF attachment.
+    if not _is_private(update):
+        return
+    user_id = update.effective_user.id
+    client_name = await client_pairing.get_paired_client(user_id)
+    if not client_name:
+        await update.message.reply_text(
+            "I don't have you linked to a client yet — ask your agent for a one-time pairing code."
+        )
+        return
+
+    try:
+        summary = await asyncio.to_thread(policy_workbook.get_client_summary, client_name)
+    except policy_workbook.PolicyWorkbookError as exc:
+        await update.message.reply_text(str(exc))
+        return
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Failed to load client summary for %s", client_name)
+        await update.message.reply_text(f"Sorry, I couldn't pull up your policy summary right now: {exc}")
+        return
+
+    await update.message.reply_text(_format_client_facing_summary(summary))
+
+
+# ---------------------------------------------------------------------------
+# Refer a friend - not pairing-gated (same reasoning as booking: passing
+# along a friend's name isn't sensitive the way seeing someone else's policy
+# would be). Two ways to refer: forward the bot directly, or reply here with
+# a friend's name/number and it's relayed straight to Nic.
+# ---------------------------------------------------------------------------
+
+async def start_referral(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_private(update):
+        return
+    user_id = update.effective_user.id
+    pending_referral[user_id] = True
+    lines = [
+        "Know someone who could use a policy review?",
+        "",
+        f"Just reply here with their name and phone number, and I'll pass it straight to {settings.agent_name}.",
+    ]
+    if settings.client_bot_username:
+        lines.append(f"\nOr forward them this bot directly: @{settings.client_bot_username}")
+    await update.message.reply_text("\n".join(lines))
+
+
+async def refer_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await start_referral(update, context)
+
+
+async def _handle_referral_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+    user_id = update.effective_user.id
+    pending_referral.pop(user_id, None)
+    client_name = await client_pairing.get_paired_client(user_id)
+    label = client_name or _client_label(update.effective_user)
+
+    try:
+        await context.bot.send_message(
+            chat_id=settings.allowed_user_id,
+            text=f"🤝 {label} referred a friend via the client bot:\n{text}",
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Failed to relay referral from %s to Nic", label)
+        await update.message.reply_text(f"Sorry, that didn't go through: {exc}. Please try again in a moment.")
+        return
+
+    await update.message.reply_text(f"Thanks! I've passed that along to {settings.agent_name}.")
 
 
 async def handle_private_submission(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -401,8 +554,10 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.message.reply_text(
             "I can:\n"
             "- Book a meeting on your agent's calendar — no pairing needed, just /book_meeting\n"
-            "- Show your policy summary as a PDF (needs a pairing code from your agent)\n"
-            "- Pass along a document you send me straight to your agent (also needs pairing)\n\n"
+            "- Show a quick text summary of your policies (needs a pairing code from your agent)\n"
+            "- Send your full policy summary as a PDF (also needs pairing)\n"
+            "- Pass along a document you send me straight to your agent (also needs pairing)\n"
+            "- Refer a friend — no pairing needed, just /refer\n\n"
             "Use the menu below any time."
         )
     else:
@@ -425,6 +580,7 @@ def main() -> None:
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("book_meeting", book_meeting_command))
+    app.add_handler(CommandHandler("refer", refer_command))
     app.add_handler(CallbackQueryHandler(meeting_callback, pattern=r"^m(day|slot):"))
     app.add_handler(MessageHandler(filters.TEXT & filters.ChatType.PRIVATE & ~filters.COMMAND, handle_private_text))
     app.add_handler(MessageHandler(
