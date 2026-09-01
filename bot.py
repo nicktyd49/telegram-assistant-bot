@@ -26,7 +26,7 @@ from telegram.ext import (
 
 from config import settings
 from assistant import anthropic_client, run_conversation
-from services import calendar_service, sheets_service, pdf_utils, policy_workbook, policy_illustration, onedrive_service, action_plan, client_pairing, news_service, poster_service
+from services import calendar_service, sheets_service, pdf_utils, policy_workbook, policy_illustration, onedrive_service, action_plan, client_pairing, news_service, poster_service, ig_post_service
 from prompts import POLICY_SUMMARY_PROMPT, RECEIPT_EXTRACTION_PROMPT, POLICY_FIELDS_EXTRACTION_PROMPT
 
 MAX_HISTORY_MESSAGES = 40
@@ -45,6 +45,7 @@ MENU_FILE = "🗂 File Client Items"
 MENU_HELP = "❓ Help"
 MENU_NEWS = "📰 News"
 MENU_POSTER = "📊 Market Poster"
+MENU_IG = "📸 IG Post"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("assistant-bot")
@@ -80,6 +81,14 @@ pending_policy_session: dict[int, dict[str, dict]] = {}
 pending_poster_session: dict[int, dict] = {}
 pending_poster_preview: dict[int, dict] = {}
 
+# In-memory per-chat "IG Post" session state - same shape as the poster
+# session above (collects text notes + a photo, in any order). Building
+# requires at least one photo among the parts. pending_ig_preview holds
+# the edited photo bytes, caption, and the raw inputs (so 🔁 Regenerate can
+# ask Claude for a fresh caption without needing the photo resent).
+pending_ig_session: dict[int, dict] = {}
+pending_ig_preview: dict[int, dict] = {}
+
 
 def _trim_history(history: list[dict]) -> None:
     """Drops old turns from the front, but only ever starting the kept
@@ -103,7 +112,7 @@ def _is_allowed(update: Update) -> bool:
 def main_menu_keyboard() -> ReplyKeyboardMarkup:
     """The persistent row of buttons at the bottom of the chat."""
     return ReplyKeyboardMarkup(
-        [[MENU_CALENDAR, MENU_RECEIPT], [MENU_POLICY, MENU_FILE], [MENU_NEWS, MENU_POSTER], [MENU_HELP]],
+        [[MENU_CALENDAR, MENU_RECEIPT], [MENU_POLICY, MENU_FILE], [MENU_NEWS, MENU_POSTER], [MENU_IG, MENU_HELP]],
         resize_keyboard=True,
     )
 
@@ -142,6 +151,20 @@ def _poster_review_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ Post to client group", callback_data="posterpost"),
          InlineKeyboardButton("🗑 Discard", callback_data="posterdiscard")],
+    ])
+
+
+def _done_ig_keyboard() -> InlineKeyboardMarkup:
+    """Shown while an 'IG Post' note-collection session is active."""
+    return InlineKeyboardMarkup([[InlineKeyboardButton("✅ Create Post", callback_data="igdone")]])
+
+
+def _ig_review_keyboard() -> InlineKeyboardMarkup:
+    """Shown under the edited photo + caption - there's no direct Instagram
+    publish integration, so this is a review/redo step, not a send step."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔁 Regenerate Caption", callback_data="igregen"),
+         InlineKeyboardButton("🗑 Discard", callback_data="igdiscard")],
     ])
 
 
@@ -192,6 +215,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "- /news — on-demand insurance news digest (Singapore-focused)",
         "- 📊 Market Poster (button below) — turn your fund house talk notes into a "
         "client-ready poster, with a preview to approve before it goes to your client group",
+        "- 📸 IG Post (button below) — send a photo and I'll crop/enhance it for Instagram "
+        "and write a caption — no auto-posting, just save the photo and copy the caption "
+        "yourself (no Instagram connection from here).",
         "- /onedrive_setup — connect OneDrive so client files and archived PDFs are backed up" + (
             " (already connected)" if settings.onedrive_token_cache else ""
         ),
@@ -554,6 +580,95 @@ async def poster_discard_callback(update: Update, context: ContextTypes.DEFAULT_
     await query.message.reply_text("Discarded — nothing was sent.", reply_markup=main_menu_keyboard())
 
 
+async def _build_ig_post(message, chat_id: int) -> None:
+    """Shared by the 'done' text command and the ✅ Create Post button - takes
+    whatever's been collected (must include at least one photo), edits the
+    most recently sent photo, asks Claude for a caption, and sends both back
+    with a review keyboard. There's no auto-publish step - Instagram has no
+    connector wired into this bot, so this is a copy/download-and-post-it-
+    yourself hand-off, same spirit as the poster preview but without the
+    'post to client group' button."""
+    state = pending_ig_session.pop(chat_id, None)
+    parts = state["parts"] if state else []
+    image_parts = [p for p in parts if p["type"] == "image"]
+    if not image_parts:
+        await message.reply_text(
+            "Nothing to work with yet - send the photo you want to post first.",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+
+    photo_bytes = base64.b64decode(image_parts[-1]["data"])
+    notes = "\n".join(p["text"] for p in parts if p["type"] == "text")
+
+    await message.chat.send_action("upload_photo")
+    try:
+        edited_bytes = ig_post_service.edit_photo(photo_bytes)
+        caption = await ig_post_service.generate_caption(photo_bytes, notes)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Failed to build IG post")
+        await message.reply_text(f"Couldn't put that post together: {exc}", reply_markup=main_menu_keyboard())
+        return
+
+    pending_ig_preview[chat_id] = {
+        "png": edited_bytes, "caption": caption, "photo_bytes": photo_bytes, "notes": notes,
+    }
+    await message.reply_photo(
+        photo=BytesIO(edited_bytes),
+        filename="ig_post.jpg",
+        caption="Here's the edited photo, cropped and enhanced for Instagram.",
+    )
+    await message.reply_text(
+        f"{caption}\n\n—\nCaption above - copy it, save the photo, and post both yourself. "
+        "No direct Instagram connection from here.",
+        reply_markup=_ig_review_keyboard(),
+    )
+
+
+async def ig_done_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not _is_allowed(update):
+        await query.answer()
+        return
+    await query.answer()
+    await _build_ig_post(query.message, update.effective_chat.id)
+
+
+async def ig_regen_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not _is_allowed(update):
+        await query.answer()
+        return
+    await query.answer()
+    chat_id = update.effective_chat.id
+    pending = pending_ig_preview.get(chat_id)
+    if not pending:
+        await query.message.reply_text("That session's expired - start a new IG Post first.")
+        return
+    await query.message.chat.send_action("typing")
+    try:
+        caption = await ig_post_service.generate_caption(pending["photo_bytes"], pending["notes"])
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Failed to regenerate IG caption")
+        await query.message.reply_text(f"Couldn't get a new caption: {exc}")
+        return
+    pending["caption"] = caption
+    await query.message.reply_text(
+        f"{caption}\n\n—\nCaption above - copy it, save the photo, and post both yourself.",
+        reply_markup=_ig_review_keyboard(),
+    )
+
+
+async def ig_discard_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not _is_allowed(update):
+        await query.answer()
+        return
+    await query.answer()
+    pending_ig_preview.pop(update.effective_chat.id, None)
+    await query.message.reply_text("Discarded.", reply_markup=main_menu_keyboard())
+
+
 async def groupid_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Run this inside the client group/channel (after adding the bot to it)
     to get its chat ID for CLIENT_GROUP_CHAT_ID on Railway — that's the only
@@ -798,6 +913,24 @@ async def _menu_poster(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
 
 
+async def _menu_ig(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Starts an 'IG Post' session - collects a photo and optional notes
+    until Done is tapped, then crops/enhances the photo and writes an
+    Instagram caption for Nic to copy and post himself."""
+    chat_id = update.effective_chat.id
+    pending_policy.pop(chat_id, None)
+    pending_policy_session.pop(chat_id, None)
+    pending_client_files.pop(chat_id, None)
+    pending_poster_session.pop(chat_id, None)
+    pending_ig_preview.pop(chat_id, None)
+    pending_ig_session[chat_id] = {"parts": []}
+    await update.message.reply_text(
+        "Send me the photo you want to post, plus any notes on what it's about (optional). "
+        "Tap ✅ Create Post below when you're done.",
+        reply_markup=_done_ig_keyboard(),
+    )
+
+
 # Persistent-keyboard button text -> handler. Checked first in handle_message
 # so tapping a button doesn't fall through to the general chat assistant.
 MENU_ACTIONS = {
@@ -807,6 +940,7 @@ MENU_ACTIONS = {
     MENU_FILE: _menu_file_client_items,
     MENU_NEWS: news_command,
     MENU_POSTER: _menu_poster,
+    MENU_IG: _menu_ig,
     MENU_HELP: help_command,
 }
 
@@ -893,6 +1027,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if text_raw != MENU_POSTER:
             pending_poster_session.pop(chat_id, None)
             pending_poster_preview.pop(chat_id, None)
+        if text_raw != MENU_IG:
+            pending_ig_session.pop(chat_id, None)
+            pending_ig_preview.pop(chat_id, None)
         await MENU_ACTIONS[text_raw](update, context)
         return
 
@@ -942,6 +1079,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text(
             f"Got it ({count} item(s) so far). Send more notes/photos, or tap ✅ Build Poster to finish.",
             reply_markup=_done_poster_keyboard(),
+        )
+        return
+
+    if chat_id in pending_ig_session:
+        if text_raw.strip().lower() in {"done", "finish"}:
+            await _build_ig_post(update.message, chat_id)
+            return
+        pending_ig_session[chat_id]["parts"].append({"type": "text", "text": text_raw})
+        count = len(pending_ig_session[chat_id]["parts"])
+        await update.message.reply_text(
+            f"Got it ({count} item(s) so far). Send the photo (if not sent yet), or tap ✅ Create Post to finish.",
+            reply_markup=_done_ig_keyboard(),
         )
         return
 
@@ -1027,6 +1176,18 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.message.reply_text(
             f"Got it ({count} item(s) so far). Send more notes/photos, or tap ✅ Build Poster to finish.",
             reply_markup=_done_poster_keyboard(),
+        )
+        return
+
+    if chat_id in pending_ig_session:
+        image_b64_ig = base64.b64encode(image_bytes).decode("ascii")
+        pending_ig_session[chat_id]["parts"].append(
+            {"type": "image", "media_type": "image/jpeg", "data": image_b64_ig}
+        )
+        count = len(pending_ig_session[chat_id]["parts"])
+        await update.message.reply_text(
+            f"Got it ({count} item(s) so far). Send more notes, or tap ✅ Create Post to finish.",
+            reply_markup=_done_ig_keyboard(),
         )
         return
 
@@ -1577,6 +1738,7 @@ async def _post_init(app: Application) -> None:
         BotCommand("today", "Today's schedule"),
         BotCommand("news", "On-demand insurance news digest"),
         BotCommand("poster", "Build a market outlook poster from your notes"),
+        BotCommand("igpost", "Edit a photo and write a caption for Instagram"),
         BotCommand("groupid", "Get this chat's ID (run inside your client group)"),
         BotCommand("client", "Look up a client's policy summary"),
         BotCommand("client_code", "Generate a client pairing code"),
@@ -1603,6 +1765,7 @@ def main() -> None:
     app.add_handler(CommandHandler("client_code", client_code_command))
     app.add_handler(CommandHandler("news", news_command))
     app.add_handler(CommandHandler("poster", _menu_poster))
+    app.add_handler(CommandHandler("igpost", _menu_ig))
     app.add_handler(CommandHandler("groupid", groupid_command))
     app.add_handler(CommandHandler("menu", menu_command))
     app.add_handler(CallbackQueryHandler(calendar_callback, pattern=r"^cal:"))
@@ -1613,6 +1776,9 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(poster_done_callback, pattern=r"^posterdone$"))
     app.add_handler(CallbackQueryHandler(poster_post_callback, pattern=r"^posterpost$"))
     app.add_handler(CallbackQueryHandler(poster_discard_callback, pattern=r"^posterdiscard$"))
+    app.add_handler(CallbackQueryHandler(ig_done_callback, pattern=r"^igdone$"))
+    app.add_handler(CallbackQueryHandler(ig_regen_callback, pattern=r"^igregen$"))
+    app.add_handler(CallbackQueryHandler(ig_discard_callback, pattern=r"^igdiscard$"))
     app.add_handler(MessageHandler(filters.Document.PDF, handle_policy_or_receipt_pdf))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.Document.ALL & ~filters.Document.PDF, handle_generic_document))
