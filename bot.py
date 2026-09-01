@@ -1538,11 +1538,35 @@ async def _check_calendar_invites(context: ContextTypes.DEFAULT_TYPE) -> None:
         await context.bot.send_message(
             chat_id=settings.allowed_user_id,
             text=f"\U0001F4C5 New calendar invite from {organizer_name}: {summary}\n{start}",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("\u2705 Accept", callback_data=f"accept_invite:{event_id}")]]
+            ),
         )
 
     # Keep this from growing forever across a long-running process.
     if len(notified_ids) > 1000:
         _invite_watch_state["notified_ids"] = set(list(notified_ids)[-500:])
+
+
+async def accept_invite_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not _is_allowed(update):
+        await query.answer()
+        return
+    await query.answer()
+    event_id = query.data.split(":", 1)[1]
+    try:
+        await calendar_service.accept_event(event_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Failed to accept calendar invite %s", event_id)
+        await query.edit_message_reply_markup(reply_markup=None)
+        await context.bot.send_message(
+            chat_id=settings.allowed_user_id,
+            text=f"Couldn't accept that invite: {exc}",
+        )
+        return
+    original = query.message.text or ""
+    await query.edit_message_text(f"{original}\n\n\u2705 Accepted")
 
 
 async def _post_init(app: Application) -> None:
@@ -1582,6 +1606,7 @@ def main() -> None:
     app.add_handler(CommandHandler("groupid", groupid_command))
     app.add_handler(CommandHandler("menu", menu_command))
     app.add_handler(CallbackQueryHandler(calendar_callback, pattern=r"^cal:"))
+    app.add_handler(CallbackQueryHandler(accept_invite_callback, pattern=r"^accept_invite:"))
     app.add_handler(CallbackQueryHandler(policy_client_callback, pattern=r"^polc:"))
     app.add_handler(CallbackQueryHandler(file_done_callback, pattern=r"^filedone$"))
     app.add_handler(CallbackQueryHandler(policy_done_callback, pattern=r"^policydone$"))

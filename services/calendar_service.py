@@ -83,6 +83,35 @@ def _delete_event_sync(event_id: str) -> None:
     service.events().delete(calendarId=settings.google_calendar_id, eventId=event_id).execute()
 
 
+def _accept_event_sync(event_id: str) -> dict:
+    """Marks Nic's own attendee entry on this event as accepted and lets
+    Google notify the organizer - accepting an invite IS that RSVP flip,
+    not a local-only note. If Nic's calendar ID isn't in the attendee list
+    (can happen if the invite went to an alias Google didn't echo back),
+    this is a no-op rather than an error - nothing to flip."""
+    service = _get_service()
+    event = service.events().get(calendarId=settings.google_calendar_id, eventId=event_id).execute()
+    attendees = event.get("attendees", [])
+    my_email = settings.google_calendar_id.lower()
+    for attendee in attendees:
+        if (attendee.get("email") or "").lower() == my_email:
+            attendee["responseStatus"] = "accepted"
+            break
+    else:
+        logger.warning("accept_event: %s has no attendee entry matching %s", event_id, settings.google_calendar_id)
+        return event
+    return (
+        service.events()
+        .patch(
+            calendarId=settings.google_calendar_id,
+            eventId=event_id,
+            body={"attendees": attendees},
+            sendUpdates="all",
+        )
+        .execute()
+    )
+
+
 def _list_updated_events_sync(updated_min_iso: str) -> list[dict]:
     """Events created or changed since updated_min_iso (an RFC3339 UTC
     timestamp), regardless of when they occur. Used to poll for new
@@ -136,6 +165,14 @@ async def delete_event(event_id: str) -> None:
         await asyncio.to_thread(_delete_event_sync, event_id)
     except HttpError as exc:
         logger.exception("Calendar delete_event failed")
+        raise RuntimeError(f"Google Calendar rejected the request: {exc.reason}") from exc
+
+
+async def accept_event(event_id: str) -> dict:
+    try:
+        return await asyncio.to_thread(_accept_event_sync, event_id)
+    except HttpError as exc:
+        logger.exception("Calendar accept_event failed")
         raise RuntimeError(f"Google Calendar rejected the request: {exc.reason}") from exc
 
 
