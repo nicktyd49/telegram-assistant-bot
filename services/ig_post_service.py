@@ -75,14 +75,25 @@ STRICT JSON only - no markdown, no commentary outside the JSON:
 "reason": "<one short sentence on the overall picks - e.g. what got dropped and why>"}"""
 
 
+def _even_sample(n: int, k: int) -> list[int]:
+    """k indices spread evenly across range(n) (always including the first and last),
+    used as select_carousel_photos' fallback so a failed AI pick still gives a
+    representative spread across everything sent instead of just the first few."""
+    if n <= k:
+        return list(range(n))
+    if k <= 1:
+        return [0]
+    return sorted({round(i * (n - 1) / (k - 1)) for i in range(k)})
+
+
 async def select_carousel_photos(image_parts: list[dict]) -> tuple[list[int], str]:
     """Given more than 5 candidate photos (each a {"media_type", "data"} dict,
     base64-encoded - the same shape used in a session's collected parts), asks Claude to
     pick 5-10 of them for an Instagram carousel post. Returns (0-based indices into
-    image_parts, in carousel order, a short reason). Falls back to the first 10 photos
-    sent (in send order) with no reason if Claude's answer can't be parsed, or if
-    parsing succeeds but yields nothing usable - never raises, since a failed pick
-    shouldn't block the post.
+    image_parts, in carousel order, a short reason). Falls back to an even spread across
+    everything sent (not just the first few - see _even_sample) with no reason if
+    Claude's answer can't be parsed, or if parsing succeeds but yields nothing usable -
+    never raises, since a failed pick shouldn't block the post.
     """
     from assistant import anthropic_client  # local import avoids a cycle at module load
 
@@ -95,10 +106,14 @@ async def select_carousel_photos(image_parts: list[dict]) -> tuple[list[int], st
         })
     content.append({"type": "text", "text": "Which photos should make the carousel? Answer with the JSON only."})
 
-    fallback = list(range(min(10, len(image_parts))))
+    fallback = _even_sample(len(image_parts), min(10, len(image_parts)))
+    # Generous headroom: ranking/deduping a big batch (many photos sent at once) needs
+    # more room to reason through than a 1-of-N pick did, and a too-tight cap here was
+    # observed to cut the response off before any JSON came out at all (empty response
+    # text, not just malformed JSON) - which silently fell back to the first few photos.
     response = await anthropic_client.messages.create(
         model=settings.anthropic_model,
-        max_tokens=400,
+        max_tokens=1536,
         system=SELECT_CAROUSEL_PROMPT,
         messages=[{"role": "user", "content": content}],
     )
@@ -107,11 +122,17 @@ async def select_carousel_photos(image_parts: list[dict]) -> tuple[list[int], st
     if cleaned.lower().startswith("json"):
         cleaned = cleaned[4:].lstrip()
     try:
+        if not cleaned:
+            raise ValueError("empty response text")
         parsed = json.loads(cleaned)
         indices = [int(i) - 1 for i in parsed["indices"]]
         reason = str(parsed.get("reason", "")).strip()
     except (json.JSONDecodeError, KeyError, ValueError, TypeError):
-        logger.warning("select_carousel_photos: couldn't parse Claude's picks, defaulting to the first %d sent | raw=%s", len(fallback), raw[:300])
+        logger.warning(
+            "select_carousel_photos: couldn't parse Claude's picks (stop_reason=%s, %d content block(s)), "
+            "defaulting to an even spread across all %d sent | raw=%s",
+            getattr(response, "stop_reason", "?"), len(response.content), len(image_parts), raw[:300],
+        )
         return fallback, ""
 
     seen: set[int] = set()
