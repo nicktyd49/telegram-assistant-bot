@@ -36,11 +36,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import traceback
 import uuid
 from datetime import date, datetime, timedelta, time as dt_time
 from io import BytesIO
 from zoneinfo import ZoneInfo
 
+import telegram
 from telegram import (
     ChatMember,
     Update,
@@ -1080,7 +1082,50 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Catches any exception a handler raises that would otherwise just get
+    logged to Railway and silently swallowed - a client would just see the
+    bot go quiet with no error and no way to know something broke. Logs it
+    properly, pings Nic directly (mirrors bot.py's error_handler, which
+    caught the same silent-failure pattern before), and gives whoever was
+    mid-conversation with the bot a plain "something broke, try again" reply
+    instead of dead air.
+
+    Exception: telegram.error.Conflict during getUpdates. This fires on every
+    redeploy (the old container briefly overlaps with the new one, both
+    polling at once) and PTB retries it internally within seconds on its
+    own - it's not something Nic can act on, so it's logged but not sent."""
+    if isinstance(context.error, telegram.error.Conflict):
+        logger.info("Transient getUpdates conflict (likely an overlapping redeploy) — PTB will retry on its own")
+        return
+    if isinstance(context.error, telegram.error.RetryAfter):
+        logger.warning("Telegram flood control hit (retry_after=%s) — not re-notifying, it's not actionable per-occurrence", context.error.retry_after)
+        return
     logger.error("Unhandled exception while processing an update", exc_info=context.error)
+    try:
+        trace = "".join(
+            traceback.format_exception(type(context.error), context.error, context.error.__traceback__)
+        )
+    except Exception:  # noqa: BLE001
+        trace = str(context.error)
+    last_line = next((ln for ln in reversed(trace.strip().splitlines())), str(context.error))
+    try:
+        await context.bot.send_message(
+            chat_id=settings.allowed_user_id,
+            text=f"\u26a0\ufe0f Client bot hit an error behind the scenes: {last_line}\n\n"
+            "Whoever was messaging it probably got no reply. Check Railway logs for the "
+            "full details if it keeps happening.",
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("Failed to notify Nic about the above error")
+    if isinstance(update, Update) and update.effective_chat is not None:
+        try:
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text="Sorry, something went wrong on my end. Please try that again in a moment — "
+                "if it still doesn't work, let your agent know.",
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to notify the chatting user about the above error")
 
 
 def main() -> None:
