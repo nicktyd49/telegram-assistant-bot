@@ -47,16 +47,27 @@ def _now() -> datetime:
 async def _load() -> dict:
     data = await onedrive_service.download_bytes(PAIRING_STORE_PATH)
     if data is None:
-        return {"pending": {}, "confirmed": {}}
+        return _empty_store()
     try:
         store = json.loads(data)
     except json.JSONDecodeError:
         logger.exception("Pairing store is corrupt JSON - starting fresh (existing pairings are lost)")
-        return {"pending": {}, "confirmed": {}}
+        return _empty_store()
     store.setdefault("pending", {})
     store.setdefault("confirmed", {})
     store.setdefault("awaiting_name", {})
     return store
+
+
+def _empty_store() -> dict:
+    # Single source of truth for a brand-new/blank store's shape - the two
+    # early-return branches above used to hand back {"pending": {},
+    # "confirmed": {}} without "awaiting_name", which is exactly what threw
+    # KeyError: 'awaiting_name' the moment mark_awaiting_name/get_awaiting_name/
+    # clear_awaiting_name ran against a freshly-created store (e.g. right
+    # after OneDrive briefly 404'd on the file). Keep this in sync with the
+    # setdefault() calls just above.
+    return {"pending": {}, "confirmed": {}, "awaiting_name": {}}
 
 
 async def _save(store: dict) -> None:
