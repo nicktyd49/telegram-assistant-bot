@@ -41,7 +41,14 @@ from datetime import date, datetime, timedelta, time as dt_time
 from io import BytesIO
 from zoneinfo import ZoneInfo
 
-from telegram import ChatMember, Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
+from telegram import (
+    ChatMember,
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
+)
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -154,24 +161,19 @@ def _is_private(update: Update) -> bool:
     return update.effective_chat.type == "private"
 
 
-def _menu_keyboard(paired: bool) -> ReplyKeyboardMarkup:
-    if paired:
-        return ReplyKeyboardMarkup(
-            [[MENU_RETRIEVE, MENU_SUMMARY], [MENU_SUBMIT, MENU_REFER], [MENU_INVITE, MENU_BOOK], [MENU_HELP]],
-            resize_keyboard=True,
-        )
-    # Booking and referring a friend don't need pairing. Retrieve Policy and
-    # Policy Summary are shown too even though both need pairing - tapping
-    # either before pairing just explains that a code is needed
-    # (send_policy_pdf / send_policy_summary_text already handle that),
-    # rather than hiding the buttons and leaving a client with no way to
-    # discover the features exist at all. Submit a Document and Invite
-    # Friends stay hidden pre-pairing - unlike the two read-only buttons
-    # above, sending Nic an unsolicited document, or minting a named invite
-    # link tied to an unknown identity, isn't something to invite before he
-    # knows who it's from.
+def _menu_keyboard() -> ReplyKeyboardMarkup:
+    # Only ever shown to a paired client - see _pairing_required_text() for
+    # the unpaired experience, which has no keyboard of its own at all.
     return ReplyKeyboardMarkup(
-        [[MENU_RETRIEVE, MENU_SUMMARY], [MENU_REFER], [MENU_BOOK], [MENU_HELP]], resize_keyboard=True,
+        [[MENU_RETRIEVE, MENU_SUMMARY], [MENU_SUBMIT, MENU_REFER], [MENU_INVITE, MENU_BOOK], [MENU_HELP]],
+        resize_keyboard=True,
+    )
+
+
+def _pairing_required_text() -> str:
+    return (
+        f"Before I can help, I'll need a one-time pairing code from {settings.agent_name} - "
+        "just paste it here and I'll get you set up."
     )
 
 
@@ -191,14 +193,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             return
         await update.message.reply_text(
             f"You're linked to {client_name}. Use the menu below any time.",
-            reply_markup=_menu_keyboard(paired=True),
+            reply_markup=_menu_keyboard(),
         )
         return
 
     existing = await client_pairing.get_paired_client(user_id)
     if existing:
         await update.message.reply_text(
-            f"Welcome back — you're linked to {existing}.", reply_markup=_menu_keyboard(paired=True),
+            f"Welcome back — you're linked to {existing}.", reply_markup=_menu_keyboard(),
         )
         return
 
@@ -211,11 +213,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
-    await update.message.reply_text(
-        "Hi! You can book a meeting any time — no code needed. To see your policy summary or "
-        "send a document, I'll need a one-time pairing code from your agent first.",
-        reply_markup=_menu_keyboard(paired=False),
-    )
+    await update.message.reply_text(_pairing_required_text(), reply_markup=ReplyKeyboardRemove())
 
 
 async def _handle_new_client_name(
@@ -257,7 +255,7 @@ async def _handle_new_client_name(
 
     await update.message.reply_text(
         f"Thanks, {full_name} — you're all set! Use the menu below any time.",
-        reply_markup=_menu_keyboard(paired=True),
+        reply_markup=_menu_keyboard(),
     )
 
     referred_by = awaiting.get("referred_by")
@@ -326,9 +324,7 @@ async def handle_private_text(update: Update, context: ContextTypes.DEFAULT_TYPE
                 f"order — I'll pass everything to {settings.agent_name} once I have both."
             )
         else:
-            await update.message.reply_text(
-                "I need a one-time pairing code from your agent before I can pass along documents."
-            )
+            await update.message.reply_text(_pairing_required_text(), reply_markup=ReplyKeyboardRemove())
         return
     if text == MENU_INVITE:
         await send_invite_link(update, context)
@@ -346,11 +342,14 @@ async def handle_private_text(update: Update, context: ContextTypes.DEFAULT_TYPE
             return
         await update.message.reply_text(
             f"You're linked to {client_name}. Use the menu below any time.",
-            reply_markup=_menu_keyboard(paired=True),
+            reply_markup=_menu_keyboard(),
         )
         return
 
-    await update.message.reply_text("Use the menu below.", reply_markup=_menu_keyboard(paired=bool(existing)))
+    if existing:
+        await update.message.reply_text("Use the menu below.", reply_markup=_menu_keyboard())
+    else:
+        await update.message.reply_text(_pairing_required_text(), reply_markup=ReplyKeyboardRemove())
 
 
 async def send_policy_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -475,6 +474,10 @@ async def start_referral(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not _is_private(update):
         return
     user_id = update.effective_user.id
+    existing = await client_pairing.get_paired_client(user_id)
+    if not existing:
+        await update.message.reply_text(_pairing_required_text(), reply_markup=ReplyKeyboardRemove())
+        return
     pending_referral[user_id] = True
     lines = [
         "Know someone who could use a policy review?",
@@ -943,6 +946,10 @@ def _day_picker_buttons(today: date, page: int) -> list:
 async def start_booking(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_private(update):
         return
+    existing = await client_pairing.get_paired_client(update.effective_user.id)
+    if not existing:
+        await update.message.reply_text(_pairing_required_text(), reply_markup=ReplyKeyboardRemove())
+        return
     if not settings.calendar_configured:
         await update.message.reply_text(
             "Meeting booking isn't set up yet — ask your agent to connect their calendar."
@@ -1047,20 +1054,22 @@ async def meeting_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if _is_private(update):
         existing = await client_pairing.get_paired_client(update.effective_user.id)
+        if not existing:
+            await update.message.reply_text(_pairing_required_text(), reply_markup=ReplyKeyboardRemove())
+            return
         await update.message.reply_text(
             "I can:\n"
-            "- Book a meeting on your agent's calendar — no pairing needed, just /book_meeting\n"
-            "- Show a quick text summary of your policies (needs a pairing code from your agent)\n"
-            "- Send your full policy summary as a PDF (also needs pairing)\n"
-            "- Pass along a document you send me straight to your agent (also needs pairing)\n"
-            "- Refer a friend — no pairing needed, just /refer\n"
-            "- Give you a personal invite link to share with friends (needs pairing), just /invite\n\n"
+            "- Book a meeting on your agent's calendar, just /book_meeting\n"
+            "- Show a quick text summary of your policies\n"
+            "- Send your full policy summary as a PDF\n"
+            "- Pass along a document you send me straight to your agent\n"
+            "- Refer a friend, just /refer\n"
+            "- Give you a personal invite link to share with friends, just /invite\n\n"
             "Use the menu below any time.",
             # Re-attaching the current keyboard here (not just in start()) means Help
             # doubles as a self-heal: if a client's keyboard is ever stuck on an old/
-            # incomplete menu - e.g. a channel link that doesn't re-fire /start - just
-            # tapping Help fixes it, without them needing to know to type /start.
-            reply_markup=_menu_keyboard(paired=bool(existing)),
+            # incomplete menu, just tapping Help fixes it.
+            reply_markup=_menu_keyboard(),
         )
     else:
         await update.message.reply_text("This bot only works in a private chat — please message me directly.")
