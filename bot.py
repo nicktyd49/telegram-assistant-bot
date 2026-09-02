@@ -670,7 +670,8 @@ async def _build_ig_post(message, chat_id: int) -> None:
 
     await message.reply_text(
         f"{caption}\n\n—\nCaption above - copy it, save the photo(s), and post both yourself. "
-        "No direct Instagram connection from here.",
+        "Want something changed? Just tell me (e.g. \"make it shorter\"), or tap 🔁 Regenerate "
+        "for a fresh take. No direct Instagram connection from here.",
         reply_markup=_ig_review_keyboard(),
     )
 
@@ -704,7 +705,8 @@ async def ig_regen_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return
     pending["caption"] = caption
     await query.message.reply_text(
-        f"{caption}\n\n—\nCaption above - copy it, save the photo(s), and post both yourself.",
+        f"{caption}\n\n—\nCaption above - copy it, save the photo(s), and post both yourself. "
+        "Want something changed? Just tell me, or tap 🔁 Regenerate again for another fresh take.",
         reply_markup=_ig_review_keyboard(),
     )
 
@@ -1155,6 +1157,28 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text(
             f"Got it ({count} item(s) so far). Send the photo (if not sent yet), or tap ✅ Create Post to finish.",
             reply_markup=_done_ig_keyboard(),
+        )
+        return
+
+    if chat_id in pending_ig_preview:
+        # A caption is already sitting in review - any plain text here is feedback on it
+        # ("make it shorter", "less salesy", "mention the venue") rather than a fresh topic,
+        # so revise the existing caption instead of rerolling one from scratch.
+        pending = pending_ig_preview[chat_id]
+        await update.message.chat.send_action("typing")
+        try:
+            revised = await ig_post_service.revise_caption(
+                pending["caption"], text_raw, pending["photo_bytes"], pending["notes"]
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Failed to revise IG caption")
+            await update.message.reply_text(f"Couldn't apply that change: {exc}")
+            return
+        pending["caption"] = revised
+        await update.message.reply_text(
+            f"{revised}\n\n—\nCaption above - copy it, save the photo(s), and post both yourself. "
+            "Want another change? Just tell me, or tap 🔁 Regenerate for a fresh take.",
+            reply_markup=_ig_review_keyboard(),
         )
         return
 

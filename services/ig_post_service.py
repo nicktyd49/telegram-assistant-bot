@@ -171,6 +171,46 @@ def edit_photo(image_bytes: bytes) -> bytes:
     return buf.getvalue()
 
 
+REVISE_CAPTION_PROMPT = """You previously wrote an Instagram caption for this post. The agent \
+now wants a specific change made to it. Revise the caption to satisfy their request while \
+keeping everything else about it intact - same overall structure (a hook line, short body \
+paragraphs, an optional call-to-action, 5-10 hashtags on their own line), same facts, same \
+voice - unless the requested change itself calls for altering one of those.
+
+Output ONLY the revised caption text - no preamble, no explanation, no quotes around it."""
+
+
+async def revise_caption(caption: str, feedback: str, image_bytes_list: list[bytes], notes: str) -> str:
+    """One Claude vision call that edits an EXISTING caption per the agent's specific
+    feedback (e.g. "make it shorter", "less salesy", "mention the venue name") rather than
+    rerolling a brand new one from scratch the way generate_caption/🔁 Regenerate does."""
+    from assistant import anthropic_client  # local import avoids a cycle at module load
+
+    notes = (notes or "").strip()
+    content: list[dict] = [
+        {
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/jpeg", "data": base64.b64encode(b).decode("ascii")},
+        }
+        for b in image_bytes_list
+    ]
+    notes_line = f"Original notes about this post: {notes}\n\n" if notes else ""
+    content.append({
+        "type": "text",
+        "text": f"{notes_line}Current caption:\n{caption}\n\nRequested change: {feedback}",
+    })
+    response = await anthropic_client.messages.create(
+        model=settings.anthropic_model,
+        max_tokens=512,
+        system=REVISE_CAPTION_PROMPT,
+        messages=[{"role": "user", "content": content}],
+    )
+    revised = "".join(b.text for b in response.content if getattr(b, "type", None) == "text").strip()
+    if not revised:
+        raise RuntimeError("Claude returned an empty caption - try again.")
+    return revised
+
+
 async def generate_caption(image_bytes_list: list[bytes], notes: str) -> str:
     """One Claude vision call covering every photo in the post (a single photo, or the
     whole selected carousel set) - same pattern as poster_service.extract_poster_content."""
