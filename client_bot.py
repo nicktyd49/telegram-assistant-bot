@@ -171,6 +171,24 @@ def _menu_keyboard() -> ReplyKeyboardMarkup:
     )
 
 
+def _menu_intro_text() -> str:
+    # Shown once, right when someone first gets paired (code redemption -
+    # via the /start deep link or a bare code typed in - or self-pairing in
+    # _handle_new_client_name()) - NOT on every "welcome back" for an
+    # already-paired return visit, so it doesn't turn into noise. Built
+    # from the MENU_* constants rather than hardcoded so it can never drift
+    # out of sync with the actual keyboard.
+    return (
+        "Here's what each button does:\n"
+        f"{MENU_RETRIEVE} — get your policy summary as a PDF, anytime\n"
+        f"{MENU_SUBMIT} — send a policy document straight to {settings.agent_name}\n"
+        f"{MENU_REFER} — pass along a friend's name and number\n"
+        f"{MENU_INVITE} — get your own link to invite friends to the Wealth Circle channel\n"
+        f"{MENU_BOOK} — check {settings.agent_name}'s calendar and book a meeting\n"
+        f"{MENU_HELP} — see this list again anytime"
+    )
+
+
 async def _offer_self_pairing(update: Update) -> None:
     """Unpaired, no pairing code in hand: ask for their full name and
     self-serve a pairing instead of dead-ending on "ask your agent for a
@@ -200,7 +218,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await update.message.reply_text(str(exc))
             return
         await update.message.reply_text(
-            f"You're linked to {client_name}. Use the menu below any time.",
+            f"You're linked to {client_name}. " + _menu_intro_text(),
             reply_markup=_menu_keyboard(),
         )
         return
@@ -265,7 +283,7 @@ async def _handle_new_client_name(
     await client_pairing.clear_awaiting_name(user_id)
 
     await update.message.reply_text(
-        f"Thanks, {full_name} — you're all set! Use the menu below any time.",
+        f"Thanks, {full_name} — you're all set!\n\n" + _menu_intro_text(),
         reply_markup=_menu_keyboard(),
     )
 
@@ -349,7 +367,7 @@ async def handle_private_text(update: Update, context: ContextTypes.DEFAULT_TYPE
             await update.message.reply_text(str(exc))
             return
         await update.message.reply_text(
-            f"You're linked to {client_name}. Use the menu below any time.",
+            f"You're linked to {client_name}. " + _menu_intro_text(),
             reply_markup=_menu_keyboard(),
         )
         return
