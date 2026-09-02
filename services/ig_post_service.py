@@ -7,11 +7,13 @@ Pillow, the same toolkit poster_service already uses for the Market Poster
 feature. No AI photo retouching (blemish removal, background swaps, etc.) -
 that would need a separate paid image-editing API this bot doesn't have.
 
-When more than one photo is sent in a session, a separate Claude vision
-call (select_best_photo) picks which one to actually use before editing/
-captioning - otherwise the caption call alone decides in the same
-one-shot-vision style as poster_service.extract_poster_content and the
-receipt/policy extraction prompts elsewhere in this bot.
+When more than 5 photos are sent in a session, a separate Claude vision call
+(select_carousel_photos) narrows them down to the best 5-10 for an Instagram
+carousel post before editing/captioning; 5 or fewer are used as-is. Either
+way, editing and captioning happen the same one-shot-vision style as
+poster_service.extract_poster_content and the receipt/policy extraction
+prompts elsewhere in this bot - captioning covers the whole selected set in
+a single call so one caption fits the carousel as a whole.
 """
 from __future__ import annotations
 
@@ -33,8 +35,10 @@ IG_SIZE = 1080
 IG_CAPTION_PROMPT = """You write Instagram captions for a Singapore life insurance and financial \
 advisory agent, in their own casual-but-professional voice - not corporate marketing copy.
 
-Given a photo and the agent's notes about it (notes may be empty - work from the photo alone \
-if so), write ONE Instagram caption:
+Given one photo, or a set of photos meant as an Instagram carousel, plus the agent's notes \
+(notes may be empty - work from the photo(s) alone if so), write ONE Instagram caption that \
+covers the whole post - if it's a carousel, write for the set as a whole rather than \
+describing each photo in turn:
 
 - Open with a short, scroll-stopping hook line (not a generic greeting).
 - 2-4 short lines/paragraphs of body copy - conversational, plain language, no jargon.
@@ -51,27 +55,34 @@ if so), write ONE Instagram caption:
 Output ONLY the caption text - no preamble, no explanation, no quotes around it."""
 
 
-SELECT_PHOTO_PROMPT = """You are choosing which ONE of several candidate photos an \
-insurance/financial advisor sent is best suited to post on Instagram.
+SELECT_CAROUSEL_PROMPT = """You are choosing which of several candidate photos an \
+insurance/financial advisor sent are best suited for an Instagram carousel post (multiple \
+photos swiped through under one caption).
 
-Judge by ordinary Instagram-post criteria: sharp focus, good lighting/exposure, flattering \
-framing and composition, a professional or clean-looking background, and general \
-social-media appeal. Ignore file order - judge each photo on its own merits.
+Pick between 5 and 10 photos - as many as are genuinely good, but never fewer than 5 unless \
+there simply aren't 5 decent candidates, and never more than 10 (Instagram's own carousel \
+limit). Judge by ordinary Instagram-post criteria: sharp focus, good lighting/exposure, \
+flattering framing and composition, a clean/professional-looking background, and general \
+social-media appeal. Drop near-duplicate or redundant shots (e.g. two almost-identical angles \
+of the same moment) in favor of variety. Ignore file order when judging - judge each photo on \
+its own merits - but return your picks in a sensible viewing order for a carousel (strongest \
+photo first).
 
 You will be shown each photo labeled "Photo 1", "Photo 2", etc., in that order. Reply with \
 STRICT JSON only - no markdown, no commentary outside the JSON:
 
-{"index": <1-based integer of the best photo>, "reason": "<one short, specific sentence \
-why - e.g. what's wrong with the others or right about this one>"}"""
+{"indices": [<1-based ints of the chosen photos, in the order they should appear>], \
+"reason": "<one short sentence on the overall picks - e.g. what got dropped and why>"}"""
 
 
-async def select_best_photo(image_parts: list[dict]) -> tuple[int, str]:
-    """Given 2+ candidate photos (each a {"media_type", "data"} dict, base64-encoded -
-    the same shape used in a session's collected parts), asks Claude to pick the one
-    best suited for an Instagram post. Returns (0-based index into image_parts, a short
-    reason). Only worth calling with more than one candidate - a single photo needs no
-    picking. Falls back to the last photo sent (index -1) with no reason if Claude's
-    answer can't be parsed - never raises, since a failed pick shouldn't block the post.
+async def select_carousel_photos(image_parts: list[dict]) -> tuple[list[int], str]:
+    """Given more than 5 candidate photos (each a {"media_type", "data"} dict,
+    base64-encoded - the same shape used in a session's collected parts), asks Claude to
+    pick 5-10 of them for an Instagram carousel post. Returns (0-based indices into
+    image_parts, in carousel order, a short reason). Falls back to the first 10 photos
+    sent (in send order) with no reason if Claude's answer can't be parsed, or if
+    parsing succeeds but yields nothing usable - never raises, since a failed pick
+    shouldn't block the post.
     """
     from assistant import anthropic_client  # local import avoids a cycle at module load
 
@@ -82,12 +93,13 @@ async def select_best_photo(image_parts: list[dict]) -> tuple[int, str]:
             "type": "image",
             "source": {"type": "base64", "media_type": part["media_type"], "data": part["data"]},
         })
-    content.append({"type": "text", "text": "Which one photo is best suited to post? Answer with the JSON only."})
+    content.append({"type": "text", "text": "Which photos should make the carousel? Answer with the JSON only."})
 
+    fallback = list(range(min(10, len(image_parts))))
     response = await anthropic_client.messages.create(
         model=settings.anthropic_model,
-        max_tokens=200,
-        system=SELECT_PHOTO_PROMPT,
+        max_tokens=400,
+        system=SELECT_CAROUSEL_PROMPT,
         messages=[{"role": "user", "content": content}],
     )
     raw = "".join(b.text for b in response.content if getattr(b, "type", None) == "text").strip()
@@ -96,14 +108,21 @@ async def select_best_photo(image_parts: list[dict]) -> tuple[int, str]:
         cleaned = cleaned[4:].lstrip()
     try:
         parsed = json.loads(cleaned)
-        idx = int(parsed["index"]) - 1
+        indices = [int(i) - 1 for i in parsed["indices"]]
         reason = str(parsed.get("reason", "")).strip()
     except (json.JSONDecodeError, KeyError, ValueError, TypeError):
-        logger.warning("select_best_photo: couldn't parse Claude's pick, defaulting to the last photo sent | raw=%s", raw[:300])
-        return len(image_parts) - 1, ""
-    if not (0 <= idx < len(image_parts)):
-        idx = len(image_parts) - 1
-    return idx, reason
+        logger.warning("select_carousel_photos: couldn't parse Claude's picks, defaulting to the first %d sent | raw=%s", len(fallback), raw[:300])
+        return fallback, ""
+
+    seen: set[int] = set()
+    deduped: list[int] = []
+    for i in indices:
+        if 0 <= i < len(image_parts) and i not in seen:
+            seen.add(i)
+            deduped.append(i)
+    if not deduped:
+        return fallback, reason
+    return deduped[:10], reason
 
 
 def edit_photo(image_bytes: bytes) -> bytes:
@@ -131,22 +150,24 @@ def edit_photo(image_bytes: bytes) -> bytes:
     return buf.getvalue()
 
 
-async def generate_caption(image_bytes: bytes, notes: str) -> str:
-    """One Claude vision call - same pattern as poster_service.extract_poster_content."""
+async def generate_caption(image_bytes_list: list[bytes], notes: str) -> str:
+    """One Claude vision call covering every photo in the post (a single photo, or the
+    whole selected carousel set) - same pattern as poster_service.extract_poster_content."""
     from assistant import anthropic_client  # local import avoids a cycle at module load
 
     notes = (notes or "").strip()
-    content = [
+    content: list[dict] = [
         {
             "type": "image",
-            "source": {"type": "base64", "media_type": "image/jpeg", "data": base64.b64encode(image_bytes).decode("ascii")},
-        },
-        {
-            "type": "text",
-            "text": f"Notes from the agent about this post: {notes}" if notes
-            else "No extra notes were given - work from the photo alone.",
-        },
+            "source": {"type": "base64", "media_type": "image/jpeg", "data": base64.b64encode(b).decode("ascii")},
+        }
+        for b in image_bytes_list
     ]
+    content.append({
+        "type": "text",
+        "text": f"Notes from the agent about this post: {notes}" if notes
+        else "No extra notes were given - work from the photo(s) alone.",
+    })
     response = await anthropic_client.messages.create(
         model=settings.anthropic_model,
         max_tokens=512,

@@ -13,7 +13,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import telegram.error
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, BotCommand
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, BotCommand, InputMediaPhoto
 from telegram.constants import ParseMode, ChatType
 from telegram.ext import (
     Application,
@@ -215,9 +215,10 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "- /news — on-demand insurance news digest (Singapore-focused)",
         "- 📊 Market Poster (button below) — turn your fund house talk notes into a "
         "client-ready poster, with a preview to approve before it goes to your client group",
-        "- 📸 IG Post (button below) — send a photo and I'll crop/enhance it for Instagram "
-        "and write a caption — no auto-posting, just save the photo and copy the caption "
-        "yourself (no Instagram connection from here).",
+        "- 📸 IG Post (button below) — send photo(s) and I'll crop/enhance them for Instagram "
+        "(picking the best 5-10 as a carousel if you send a lot) and write one caption — no "
+        "auto-posting, just save the photo(s) and copy the caption yourself (no Instagram "
+        "connection from here).",
         "- /onedrive_setup — connect OneDrive so client files and archived PDFs are backed up" + (
             " (already connected)" if settings.onedrive_token_cache else ""
         ),
@@ -582,58 +583,79 @@ async def poster_discard_callback(update: Update, context: ContextTypes.DEFAULT_
 
 async def _build_ig_post(message, chat_id: int) -> None:
     """Shared by the 'done' text command and the ✅ Create Post button - takes
-    whatever's been collected (must include at least one photo). If more
-    than one photo was sent, asks Claude to pick the most suitable one
-    first (ig_post_service.select_best_photo) rather than just grabbing
-    whichever arrived last. Then edits that photo, asks Claude for a
-    caption, and sends both back with a review keyboard. There's no
-    auto-publish step - Instagram has no connector wired into this bot, so
-    this is a copy/download-and-post-it-yourself hand-off, same spirit as
-    the poster preview but without the 'post to client group' button."""
+    whatever's been collected (must include at least one photo). 5 or fewer
+    photos are used as-is (a single-photo post if just 1, otherwise a
+    carousel of all of them); more than 5 and Claude narrows them down to
+    the best 5-10 for a carousel first (ig_post_service.select_carousel_photos)
+    rather than just grabbing them all. Each selected photo gets edited, one
+    caption is written covering the whole set, and both come back with a
+    review keyboard. There's no auto-publish step - Instagram has no
+    connector wired into this bot, so this is a copy/download-and-post-it-
+    yourself hand-off, same spirit as the poster preview but without the
+    'post to client group' button."""
     state = pending_ig_session.pop(chat_id, None)
     parts = state["parts"] if state else []
     image_parts = [p for p in parts if p["type"] == "image"]
     if not image_parts:
         await message.reply_text(
-            "Nothing to work with yet - send the photo you want to post first.",
+            "Nothing to work with yet - send the photo(s) you want to post first.",
             reply_markup=main_menu_keyboard(),
         )
         return
 
     pick_note = ""
-    if len(image_parts) > 1:
+    if len(image_parts) <= 5:
+        selected = list(range(len(image_parts)))
+    else:
         await message.chat.send_action("typing")
         try:
-            best_idx, reason = await ig_post_service.select_best_photo(image_parts)
+            selected, reason = await ig_post_service.select_carousel_photos(image_parts)
         except Exception:  # noqa: BLE001
-            logger.exception("Failed to pick the best IG photo - falling back to the last one sent")
-            best_idx, reason = len(image_parts) - 1, ""
-        pick_note = f"Picked photo {best_idx + 1} of {len(image_parts)}" + (f" — {reason}" if reason else "") + ".\n"
-    else:
-        best_idx = 0
+            logger.exception("Failed to pick carousel photos - falling back to the first ones sent")
+            selected, reason = list(range(min(10, len(image_parts)))), ""
+        pick_note = (
+            f"Picked {len(selected)} of {len(image_parts)} photos for the carousel"
+            + (f" — {reason}" if reason else "") + ".\n"
+        )
 
-    photo_bytes = base64.b64decode(image_parts[best_idx]["data"])
+    raw_photo_bytes = [base64.b64decode(image_parts[i]["data"]) for i in selected]
     notes = "\n".join(p["text"] for p in parts if p["type"] == "text")
 
     await message.chat.send_action("upload_photo")
     try:
-        edited_bytes = ig_post_service.edit_photo(photo_bytes)
-        caption = await ig_post_service.generate_caption(photo_bytes, notes)
+        edited_bytes_list = [ig_post_service.edit_photo(b) for b in raw_photo_bytes]
+        caption = await ig_post_service.generate_caption(raw_photo_bytes, notes)
     except Exception as exc:  # noqa: BLE001
         logger.exception("Failed to build IG post")
         await message.reply_text(f"Couldn't put that post together: {exc}", reply_markup=main_menu_keyboard())
         return
 
     pending_ig_preview[chat_id] = {
-        "png": edited_bytes, "caption": caption, "photo_bytes": photo_bytes, "notes": notes,
+        "edited": edited_bytes_list, "caption": caption, "photo_bytes": raw_photo_bytes, "notes": notes,
     }
-    await message.reply_photo(
-        photo=BytesIO(edited_bytes),
-        filename="ig_post.jpg",
-        caption=f"{pick_note}Here's the edited photo, cropped and enhanced for Instagram.",
-    )
+
+    if len(edited_bytes_list) == 1:
+        await message.reply_photo(
+            photo=BytesIO(edited_bytes_list[0]),
+            filename="ig_post.jpg",
+            caption=f"{pick_note}Here's the edited photo, cropped and enhanced for Instagram.",
+        )
+    else:
+        media = [
+            InputMediaPhoto(
+                media=BytesIO(b),
+                filename=f"ig_post_{i + 1}.jpg",
+                caption=(
+                    f"{pick_note}Here's the carousel, cropped and enhanced for Instagram - swipe through."
+                    if i == 0 else None
+                ),
+            )
+            for i, b in enumerate(edited_bytes_list)
+        ]
+        await message.reply_media_group(media=media)
+
     await message.reply_text(
-        f"{caption}\n\n—\nCaption above - copy it, save the photo, and post both yourself. "
+        f"{caption}\n\n—\nCaption above - copy it, save the photo(s), and post both yourself. "
         "No direct Instagram connection from here.",
         reply_markup=_ig_review_keyboard(),
     )
@@ -668,7 +690,7 @@ async def ig_regen_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return
     pending["caption"] = caption
     await query.message.reply_text(
-        f"{caption}\n\n—\nCaption above - copy it, save the photo, and post both yourself.",
+        f"{caption}\n\n—\nCaption above - copy it, save the photo(s), and post both yourself.",
         reply_markup=_ig_review_keyboard(),
     )
 
@@ -928,9 +950,11 @@ async def _menu_poster(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def _menu_ig(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Starts an 'IG Post' session - collects a photo and optional notes
-    until Done is tapped, then crops/enhances the photo and writes an
-    Instagram caption for Nic to copy and post himself."""
+    """Starts an 'IG Post' session - collects photos and optional notes
+    until Done is tapped, then crops/enhances the photo(s) and writes an
+    Instagram caption for Nic to copy and post himself. 5 or fewer photos
+    are used as-is; more than that and Claude narrows it down to a 5-10
+    photo carousel."""
     chat_id = update.effective_chat.id
     pending_policy.pop(chat_id, None)
     pending_policy_session.pop(chat_id, None)
@@ -939,9 +963,9 @@ async def _menu_ig(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     pending_ig_preview.pop(chat_id, None)
     pending_ig_session[chat_id] = {"parts": []}
     await update.message.reply_text(
-        "Send me the photo you want to post (send a few if you're not sure which - I'll pick "
-        "the best one), plus any notes on what it's about (optional). Tap ✅ Create Post below "
-        "when you're done.",
+        "Send me the photo(s) you want to post, plus any notes on what it's about (optional). "
+        "Send 5 or fewer and I'll use all of them; send more and I'll pick the best 5-10 for a "
+        "carousel. Tap ✅ Create Post below when you're done.",
         reply_markup=_done_ig_keyboard(),
     )
 
@@ -1758,7 +1782,7 @@ async def _post_init(app: Application) -> None:
         BotCommand("today", "Today's schedule"),
         BotCommand("news", "On-demand insurance news digest"),
         BotCommand("poster", "Build a market outlook poster from your notes"),
-        BotCommand("igpost", "Edit a photo and write a caption for Instagram"),
+        BotCommand("igpost", "Edit photo(s) and write a caption for Instagram"),
         BotCommand("groupid", "Get this chat's ID (run inside your client group)"),
         BotCommand("client", "Look up a client's policy summary"),
         BotCommand("client_code", "Generate a client pairing code"),
