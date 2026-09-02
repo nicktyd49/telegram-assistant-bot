@@ -7,14 +7,17 @@ Pillow, the same toolkit poster_service already uses for the Market Poster
 feature. No AI photo retouching (blemish removal, background swaps, etc.) -
 that would need a separate paid image-editing API this bot doesn't have.
 
-The caption is the one Claude call here, in the same one-shot-vision style
-as poster_service.extract_poster_content and the receipt/policy extraction
-prompts elsewhere in this bot.
+When more than one photo is sent in a session, a separate Claude vision
+call (select_best_photo) picks which one to actually use before editing/
+captioning - otherwise the caption call alone decides in the same
+one-shot-vision style as poster_service.extract_poster_content and the
+receipt/policy extraction prompts elsewhere in this bot.
 """
 from __future__ import annotations
 
 import base64
 import io
+import json
 import logging
 
 from PIL import Image, ImageEnhance, ImageOps
@@ -46,6 +49,61 @@ if so), write ONE Instagram caption:
   conversation instead.
 
 Output ONLY the caption text - no preamble, no explanation, no quotes around it."""
+
+
+SELECT_PHOTO_PROMPT = """You are choosing which ONE of several candidate photos an \
+insurance/financial advisor sent is best suited to post on Instagram.
+
+Judge by ordinary Instagram-post criteria: sharp focus, good lighting/exposure, flattering \
+framing and composition, a professional or clean-looking background, and general \
+social-media appeal. Ignore file order - judge each photo on its own merits.
+
+You will be shown each photo labeled "Photo 1", "Photo 2", etc., in that order. Reply with \
+STRICT JSON only - no markdown, no commentary outside the JSON:
+
+{"index": <1-based integer of the best photo>, "reason": "<one short, specific sentence \
+why - e.g. what's wrong with the others or right about this one>"}"""
+
+
+async def select_best_photo(image_parts: list[dict]) -> tuple[int, str]:
+    """Given 2+ candidate photos (each a {"media_type", "data"} dict, base64-encoded -
+    the same shape used in a session's collected parts), asks Claude to pick the one
+    best suited for an Instagram post. Returns (0-based index into image_parts, a short
+    reason). Only worth calling with more than one candidate - a single photo needs no
+    picking. Falls back to the last photo sent (index -1) with no reason if Claude's
+    answer can't be parsed - never raises, since a failed pick shouldn't block the post.
+    """
+    from assistant import anthropic_client  # local import avoids a cycle at module load
+
+    content: list[dict] = []
+    for i, part in enumerate(image_parts, start=1):
+        content.append({"type": "text", "text": f"Photo {i}:"})
+        content.append({
+            "type": "image",
+            "source": {"type": "base64", "media_type": part["media_type"], "data": part["data"]},
+        })
+    content.append({"type": "text", "text": "Which one photo is best suited to post? Answer with the JSON only."})
+
+    response = await anthropic_client.messages.create(
+        model=settings.anthropic_model,
+        max_tokens=200,
+        system=SELECT_PHOTO_PROMPT,
+        messages=[{"role": "user", "content": content}],
+    )
+    raw = "".join(b.text for b in response.content if getattr(b, "type", None) == "text").strip()
+    cleaned = raw.strip("`")
+    if cleaned.lower().startswith("json"):
+        cleaned = cleaned[4:].lstrip()
+    try:
+        parsed = json.loads(cleaned)
+        idx = int(parsed["index"]) - 1
+        reason = str(parsed.get("reason", "")).strip()
+    except (json.JSONDecodeError, KeyError, ValueError, TypeError):
+        logger.warning("select_best_photo: couldn't parse Claude's pick, defaulting to the last photo sent | raw=%s", raw[:300])
+        return len(image_parts) - 1, ""
+    if not (0 <= idx < len(image_parts)):
+        idx = len(image_parts) - 1
+    return idx, reason
 
 
 def edit_photo(image_bytes: bytes) -> bytes:

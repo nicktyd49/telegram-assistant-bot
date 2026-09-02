@@ -582,12 +582,14 @@ async def poster_discard_callback(update: Update, context: ContextTypes.DEFAULT_
 
 async def _build_ig_post(message, chat_id: int) -> None:
     """Shared by the 'done' text command and the ✅ Create Post button - takes
-    whatever's been collected (must include at least one photo), edits the
-    most recently sent photo, asks Claude for a caption, and sends both back
-    with a review keyboard. There's no auto-publish step - Instagram has no
-    connector wired into this bot, so this is a copy/download-and-post-it-
-    yourself hand-off, same spirit as the poster preview but without the
-    'post to client group' button."""
+    whatever's been collected (must include at least one photo). If more
+    than one photo was sent, asks Claude to pick the most suitable one
+    first (ig_post_service.select_best_photo) rather than just grabbing
+    whichever arrived last. Then edits that photo, asks Claude for a
+    caption, and sends both back with a review keyboard. There's no
+    auto-publish step - Instagram has no connector wired into this bot, so
+    this is a copy/download-and-post-it-yourself hand-off, same spirit as
+    the poster preview but without the 'post to client group' button."""
     state = pending_ig_session.pop(chat_id, None)
     parts = state["parts"] if state else []
     image_parts = [p for p in parts if p["type"] == "image"]
@@ -598,7 +600,19 @@ async def _build_ig_post(message, chat_id: int) -> None:
         )
         return
 
-    photo_bytes = base64.b64decode(image_parts[-1]["data"])
+    pick_note = ""
+    if len(image_parts) > 1:
+        await message.chat.send_action("typing")
+        try:
+            best_idx, reason = await ig_post_service.select_best_photo(image_parts)
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to pick the best IG photo - falling back to the last one sent")
+            best_idx, reason = len(image_parts) - 1, ""
+        pick_note = f"Picked photo {best_idx + 1} of {len(image_parts)}" + (f" — {reason}" if reason else "") + ".\n"
+    else:
+        best_idx = 0
+
+    photo_bytes = base64.b64decode(image_parts[best_idx]["data"])
     notes = "\n".join(p["text"] for p in parts if p["type"] == "text")
 
     await message.chat.send_action("upload_photo")
@@ -616,7 +630,7 @@ async def _build_ig_post(message, chat_id: int) -> None:
     await message.reply_photo(
         photo=BytesIO(edited_bytes),
         filename="ig_post.jpg",
-        caption="Here's the edited photo, cropped and enhanced for Instagram.",
+        caption=f"{pick_note}Here's the edited photo, cropped and enhanced for Instagram.",
     )
     await message.reply_text(
         f"{caption}\n\n—\nCaption above - copy it, save the photo, and post both yourself. "
@@ -925,8 +939,9 @@ async def _menu_ig(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     pending_ig_preview.pop(chat_id, None)
     pending_ig_session[chat_id] = {"parts": []}
     await update.message.reply_text(
-        "Send me the photo you want to post, plus any notes on what it's about (optional). "
-        "Tap ✅ Create Post below when you're done.",
+        "Send me the photo you want to post (send a few if you're not sure which - I'll pick "
+        "the best one), plus any notes on what it's about (optional). Tap ✅ Create Post below "
+        "when you're done.",
         reply_markup=_done_ig_keyboard(),
     )
 
@@ -1184,9 +1199,10 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         pending_ig_session[chat_id]["parts"].append(
             {"type": "image", "media_type": "image/jpeg", "data": image_b64_ig}
         )
-        count = len(pending_ig_session[chat_id]["parts"])
+        photo_count = sum(1 for p in pending_ig_session[chat_id]["parts"] if p["type"] == "image")
+        hint = "I'll pick the best one" if photo_count > 1 else "send more if you want me to pick the best one"
         await update.message.reply_text(
-            f"Got it ({count} item(s) so far). Send more notes, or tap ✅ Create Post to finish.",
+            f"Got it ({photo_count} photo(s) so far - {hint}). Send more notes/photos, or tap ✅ Create Post to finish.",
             reply_markup=_done_ig_keyboard(),
         )
         return
