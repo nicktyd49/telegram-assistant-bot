@@ -1174,7 +1174,10 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     chat_id = update.effective_chat.id
     photo = update.message.photo[-1]  # largest size
 
-    await update.message.chat.send_action("typing")
+    try:
+        await update.message.chat.send_action("typing")
+    except telegram.error.RetryAfter:
+        pass  # Telegram flood control - harmless to skip the typing indicator
     tg_file = await context.bot.get_file(photo.file_id)
     image_bytes = bytes(await tg_file.download_as_bytearray())
 
@@ -1199,12 +1202,10 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         pending_ig_session[chat_id]["parts"].append(
             {"type": "image", "media_type": "image/jpeg", "data": image_b64_ig}
         )
-        photo_count = sum(1 for p in pending_ig_session[chat_id]["parts"] if p["type"] == "image")
-        hint = "I'll pick the best one" if photo_count > 1 else "send more if you want me to pick the best one"
-        await update.message.reply_text(
-            f"Got it ({photo_count} photo(s) so far - {hint}). Send more notes/photos, or tap ✅ Create Post to finish.",
-            reply_markup=_done_ig_keyboard(),
-        )
+        # No per-photo reply - sending many photos in a row used to fire one
+        # "Got it..." message each, which could trip Telegram's flood control
+        # on a fast multi-photo send. Just collect silently; the original
+        # prompt's ✅ Create Post button (or typing "done") finishes the session.
         return
 
     caption = (update.message.caption or "").lower()
@@ -1644,6 +1645,9 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
     own — it's not something Nic can act on, so it's logged but not sent."""
     if isinstance(context.error, telegram.error.Conflict):
         logger.info("Transient getUpdates conflict (likely an overlapping redeploy) — PTB will retry on its own")
+        return
+    if isinstance(context.error, telegram.error.RetryAfter):
+        logger.warning("Telegram flood control hit (retry_after=%s) — not re-notifying, it's not actionable per-occurrence", context.error.retry_after)
         return
     logger.error("Unhandled exception while processing an update", exc_info=context.error)
     try:
