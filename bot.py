@@ -1341,8 +1341,18 @@ def _parse_json_block(raw_text: str) -> dict | None:
     try:
         return json.loads(cleaned)
     except json.JSONDecodeError:
-        logger.warning("Could not parse JSON from model output: %s", raw_text[:300])
-        return None
+        pass
+    # The model sometimes wraps the JSON in an explanatory sentence (e.g. "This is a
+    # photo of X, not a receipt" alongside the null-fields JSON) - pull out just the
+    # {...} block rather than giving up on the whole response.
+    match = re.search(r"\{.*\}", cleaned, re.DOTALL)
+    if match:
+        try:
+            return json.loads(match.group(0))
+        except json.JSONDecodeError:
+            pass
+    logger.warning("Could not parse JSON from model output: %s", raw_text[:300])
+    return None
 
 
 def _fmt_amount(value) -> str:
@@ -1623,7 +1633,7 @@ async def policy_done_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     await _close_policy_session(update, update.effective_chat.id, edit=True)
 
 
-async def _log_parsed_receipt(update: Update, data: dict) -> None:
+async def _log_parsed_receipt(update: Update, data: dict, from_photo: bool = False) -> None:
     vendor = data.get("vendor") or "Unknown vendor"
     amount = data.get("amount")
     date = data.get("date") or datetime.now(ZoneInfo(settings.timezone)).strftime("%Y-%m-%d")
@@ -1632,6 +1642,17 @@ async def _log_parsed_receipt(update: Update, data: dict) -> None:
     notes = data.get("notes")
 
     if amount is None:
+        if from_photo and not data.get("vendor") and not data.get("date"):
+            # Every field came back empty - this almost certainly isn't a receipt at all,
+            # not just a hard-to-read one. The most common reason a random photo lands
+            # here is it was meant for another photo feature (IG Post) but that session
+            # was never started first, so a bare photo defaults to receipt logging.
+            await update.message.reply_text(
+                "That doesn't look like a receipt to me, so there's nothing to log. If you "
+                "meant this for Instagram, tap 📸 IG Post (or send /igpost) first, "
+                "then resend the photo."
+            )
+            return
         await update.message.reply_text(
             "I couldn't confidently read an amount off that receipt — could you tell me the "
             "amount (and vendor/date if I got those wrong) in a text message and I'll log it?"
@@ -1683,7 +1704,7 @@ async def _extract_and_log_receipt_from_image(update: Update, image_b64: str) ->
             "amount, and date in a text message instead?"
         )
         return
-    await _log_parsed_receipt(update, data)
+    await _log_parsed_receipt(update, data, from_photo=True)
 
 
 async def _extract_and_log_receipt_from_text(update: Update, text: str) -> None:
