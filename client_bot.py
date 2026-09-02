@@ -162,7 +162,7 @@ def _is_private(update: Update) -> bool:
 
 
 def _menu_keyboard() -> ReplyKeyboardMarkup:
-    # Only ever shown to a paired client - see _pairing_required_text() for
+    # Only ever shown to a paired client - see _offer_self_pairing() for
     # the unpaired experience, which has no keyboard of its own at all.
     return ReplyKeyboardMarkup(
         [[MENU_RETRIEVE, MENU_SUMMARY], [MENU_SUBMIT, MENU_REFER], [MENU_INVITE, MENU_BOOK], [MENU_HELP]],
@@ -170,10 +170,17 @@ def _menu_keyboard() -> ReplyKeyboardMarkup:
     )
 
 
-def _pairing_required_text() -> str:
-    return (
-        f"Before I can help, I'll need a one-time pairing code from {settings.agent_name} - "
-        "just paste it here and I'll get you set up."
+async def _offer_self_pairing(update: Update) -> None:
+    """Unpaired, no pairing code in hand: ask for their full name and
+    self-serve a pairing instead of dead-ending on "ask your agent for a
+    code". Marks them awaiting_name (same durable flag the Invite Friends
+    referral flow uses) so their next plain-text reply is picked up by
+    _handle_new_client_name via the awaiting_name check already at the top
+    of handle_private_text."""
+    await client_pairing.mark_awaiting_name(update.effective_user.id, referred_by=None)
+    await update.message.reply_text(
+        "Before I can help, what's your full name? This is how I'll file your policy records.",
+        reply_markup=ReplyKeyboardRemove(),
     )
 
 
@@ -213,19 +220,22 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
-    await update.message.reply_text(_pairing_required_text(), reply_markup=ReplyKeyboardRemove())
+    await _offer_self_pairing(update)
 
 
 async def _handle_new_client_name(
     update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int, text: str, awaiting: dict,
 ) -> None:
-    """Handles a free-text reply from a Telegram user who joined the Wealth
-    Circle channel via a named Invite Friends link and is now being asked
-    for their full name (see start() / handle_private_text()). Validates
-    against existing client names first - so a typo or a joke reply can
-    never silently attach itself to a real client's existing OneDrive
-    folder - then creates a blank workbook for them, pairs them directly
-    (no code needed), and lets Nic know."""
+    """Handles a free-text reply from an unpaired Telegram user who's just
+    been asked for their full name - either because they joined via a
+    named Invite Friends link, or because they hit any gated feature with
+    no pairing code and were offered self-pairing instead (see
+    _offer_self_pairing() / start() / handle_private_text()). Validates
+    against existing client names first - so a typo, a joke reply, or
+    someone trying to claim a name that isn't theirs can never silently
+    attach itself to a real client's existing OneDrive folder - then
+    creates a blank workbook for them, pairs them directly (no code
+    needed), and lets Nic know."""
     full_name = text.strip()
     if len(full_name) < 2:
         await update.message.reply_text(
@@ -324,7 +334,7 @@ async def handle_private_text(update: Update, context: ContextTypes.DEFAULT_TYPE
                 f"order — I'll pass everything to {settings.agent_name} once I have both."
             )
         else:
-            await update.message.reply_text(_pairing_required_text(), reply_markup=ReplyKeyboardRemove())
+            await _offer_self_pairing(update)
         return
     if text == MENU_INVITE:
         await send_invite_link(update, context)
@@ -349,7 +359,7 @@ async def handle_private_text(update: Update, context: ContextTypes.DEFAULT_TYPE
     if existing:
         await update.message.reply_text("Use the menu below.", reply_markup=_menu_keyboard())
     else:
-        await update.message.reply_text(_pairing_required_text(), reply_markup=ReplyKeyboardRemove())
+        await _offer_self_pairing(update)
 
 
 async def send_policy_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -358,9 +368,7 @@ async def send_policy_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     user_id = update.effective_user.id
     client_name = await client_pairing.get_paired_client(user_id)
     if not client_name:
-        await update.message.reply_text(
-            "I don't have you linked to a client yet — ask your agent for a one-time pairing code."
-        )
+        await _offer_self_pairing(update)
         return
 
     await update.message.reply_chat_action("upload_document")
@@ -445,9 +453,7 @@ async def send_policy_summary_text(update: Update, context: ContextTypes.DEFAULT
     user_id = update.effective_user.id
     client_name = await client_pairing.get_paired_client(user_id)
     if not client_name:
-        await update.message.reply_text(
-            "I don't have you linked to a client yet — ask your agent for a one-time pairing code."
-        )
+        await _offer_self_pairing(update)
         return
 
     try:
@@ -476,7 +482,7 @@ async def start_referral(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     user_id = update.effective_user.id
     existing = await client_pairing.get_paired_client(user_id)
     if not existing:
-        await update.message.reply_text(_pairing_required_text(), reply_markup=ReplyKeyboardRemove())
+        await _offer_self_pairing(update)
         return
     pending_referral[user_id] = True
     lines = [
@@ -525,9 +531,7 @@ async def send_invite_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     user_id = update.effective_user.id
     client_name = await client_pairing.get_paired_client(user_id)
     if not client_name:
-        await update.message.reply_text(
-            "I need a one-time pairing code from your agent before I can give you an invite link."
-        )
+        await _offer_self_pairing(update)
         return
 
     if not settings.client_group_chat_id:
@@ -948,7 +952,7 @@ async def start_booking(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
     existing = await client_pairing.get_paired_client(update.effective_user.id)
     if not existing:
-        await update.message.reply_text(_pairing_required_text(), reply_markup=ReplyKeyboardRemove())
+        await _offer_self_pairing(update)
         return
     if not settings.calendar_configured:
         await update.message.reply_text(
@@ -1055,7 +1059,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if _is_private(update):
         existing = await client_pairing.get_paired_client(update.effective_user.id)
         if not existing:
-            await update.message.reply_text(_pairing_required_text(), reply_markup=ReplyKeyboardRemove())
+            await _offer_self_pairing(update)
             return
         await update.message.reply_text(
             "I can:\n"
