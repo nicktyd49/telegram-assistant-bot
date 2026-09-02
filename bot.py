@@ -583,25 +583,39 @@ async def poster_discard_callback(update: Update, context: ContextTypes.DEFAULT_
 
 async def _build_ig_post(message, chat_id: int) -> None:
     """Shared by the 'done' text command and the ✅ Create Post button - takes
-    whatever's been collected (must include at least one photo). 5 or fewer
-    photos are used as-is (a single-photo post if just 1, otherwise a
-    carousel of all of them); more than 5 and Claude narrows them down to
-    the best 5-10 for a carousel first (ig_post_service.select_carousel_photos)
+    whatever's been collected (must include at least one photo). If no notes
+    have been typed in yet, asks "What's this post about?" once and waits
+    for a reply (or "skip") instead of building blind - see the
+    ig_state["asked_topic"] handling in handle_message. 5 or fewer photos
+    are used as-is (a single-photo post if just 1, otherwise a carousel of
+    all of them); more than 5 and Claude narrows them down to the best
+    5-10 for a carousel first (ig_post_service.select_carousel_photos)
     rather than just grabbing them all. Each selected photo gets edited, one
     caption is written covering the whole set, and both come back with a
     review keyboard. There's no auto-publish step - Instagram has no
     connector wired into this bot, so this is a copy/download-and-post-it-
     yourself hand-off, same spirit as the poster preview but without the
     'post to client group' button."""
-    state = pending_ig_session.pop(chat_id, None)
+    state = pending_ig_session.get(chat_id)
     parts = state["parts"] if state else []
     image_parts = [p for p in parts if p["type"] == "image"]
     if not image_parts:
+        pending_ig_session.pop(chat_id, None)
         await message.reply_text(
             "Nothing to work with yet - send the photo(s) you want to post first.",
             reply_markup=main_menu_keyboard(),
         )
         return
+
+    has_notes = any(p["type"] == "text" for p in parts)
+    if not has_notes and not state.get("asked_topic"):
+        state["asked_topic"] = True
+        await message.reply_text(
+            "What's this post about? Send a line or two and I'll write the caption around it "
+            "- or type \"skip\" to have me work from the photo(s) alone."
+        )
+        return
+    pending_ig_session.pop(chat_id, None)
 
     pick_note = ""
     if len(image_parts) <= 5:
@@ -961,11 +975,12 @@ async def _menu_ig(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     pending_client_files.pop(chat_id, None)
     pending_poster_session.pop(chat_id, None)
     pending_ig_preview.pop(chat_id, None)
-    pending_ig_session[chat_id] = {"parts": []}
+    pending_ig_session[chat_id] = {"parts": [], "asked_topic": False}
     await update.message.reply_text(
-        "Send me the photo(s) you want to post, plus any notes on what it's about (optional). "
-        "Send 5 or fewer and I'll use all of them; send more and I'll pick the best 5-10 for a "
-        "carousel. Tap ✅ Create Post below when you're done.",
+        "Send me the photo(s) you want to post. Send 5 or fewer and I'll use all of them; "
+        "send more and I'll pick the best 5-10 for a carousel. Tell me what it's about now if "
+        "you like, or I'll ask before writing the caption. Tap ✅ Create Post below when you're "
+        "done with photos.",
         reply_markup=_done_ig_keyboard(),
     )
 
@@ -1122,11 +1137,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     if chat_id in pending_ig_session:
-        if text_raw.strip().lower() in {"done", "finish"}:
+        text_clean = text_raw.strip()
+        ig_state = pending_ig_session[chat_id]
+        ig_has_notes = any(p["type"] == "text" for p in ig_state["parts"])
+        if text_clean.lower() in {"done", "finish"}:
             await _build_ig_post(update.message, chat_id)
             return
-        pending_ig_session[chat_id]["parts"].append({"type": "text", "text": text_raw})
-        count = len(pending_ig_session[chat_id]["parts"])
+        if ig_state.get("asked_topic") and not ig_has_notes:
+            # This is the answer to "What's this post about?" - use it (unless skipped)
+            # and build right away instead of waiting for another Done tap.
+            if text_clean.lower() != "skip":
+                ig_state["parts"].append({"type": "text", "text": text_raw})
+            await _build_ig_post(update.message, chat_id)
+            return
+        ig_state["parts"].append({"type": "text", "text": text_raw})
+        count = len(ig_state["parts"])
         await update.message.reply_text(
             f"Got it ({count} item(s) so far). Send the photo (if not sent yet), or tap ✅ Create Post to finish.",
             reply_markup=_done_ig_keyboard(),
