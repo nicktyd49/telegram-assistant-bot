@@ -1046,6 +1046,7 @@ async def meeting_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if _is_private(update):
+        existing = await client_pairing.get_paired_client(update.effective_user.id)
         await update.message.reply_text(
             "I can:\n"
             "- Book a meeting on your agent's calendar — no pairing needed, just /book_meeting\n"
@@ -1054,7 +1055,12 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             "- Pass along a document you send me straight to your agent (also needs pairing)\n"
             "- Refer a friend — no pairing needed, just /refer\n"
             "- Give you a personal invite link to share with friends (needs pairing), just /invite\n\n"
-            "Use the menu below any time."
+            "Use the menu below any time.",
+            # Re-attaching the current keyboard here (not just in start()) means Help
+            # doubles as a self-heal: if a client's keyboard is ever stuck on an old/
+            # incomplete menu - e.g. a channel link that doesn't re-fire /start - just
+            # tapping Help fixes it, without them needing to know to type /start.
+            reply_markup=_menu_keyboard(paired=bool(existing)),
         )
     else:
         await update.message.reply_text("This bot only works in a private chat — please message me directly.")
