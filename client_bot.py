@@ -89,7 +89,6 @@ DAYS_PER_PAGE = 5
 MEETING_BUFFER_MINUTES = 60
 
 MENU_RETRIEVE = "📄 Retrieve Policy"
-MENU_SUMMARY = "📋 Policy Summary"
 MENU_SUBMIT = "📤 Submit a Document"
 MENU_REFER = "🤝 Refer a Friend"
 MENU_INVITE = "🔗 Invite Friends"
@@ -98,7 +97,7 @@ MENU_HELP = "❓ Help"
 
 # Every menu button label, used to tell a real menu tap apart from free
 # text typed while some other pending state (e.g. a referral) is open.
-MENU_TEXTS = {MENU_RETRIEVE, MENU_SUMMARY, MENU_SUBMIT, MENU_REFER, MENU_INVITE, MENU_BOOK, MENU_HELP}
+MENU_TEXTS = {MENU_RETRIEVE, MENU_SUBMIT, MENU_REFER, MENU_INVITE, MENU_BOOK, MENU_HELP}
 
 # The Wealth Circle channel's pinned "message my bot" link is a plain
 # t.me/<bot>?start=GENERIC_LINK_START_PAYLOAD deep link (not tied to any
@@ -167,7 +166,7 @@ def _menu_keyboard() -> ReplyKeyboardMarkup:
     # Only ever shown to a paired client - see _offer_self_pairing() for
     # the unpaired experience, which has no keyboard of its own at all.
     return ReplyKeyboardMarkup(
-        [[MENU_RETRIEVE, MENU_SUMMARY], [MENU_SUBMIT, MENU_REFER], [MENU_INVITE, MENU_BOOK], [MENU_HELP]],
+        [[MENU_RETRIEVE, MENU_SUBMIT], [MENU_REFER, MENU_INVITE], [MENU_BOOK, MENU_HELP]],
         resize_keyboard=True,
     )
 
@@ -322,9 +321,6 @@ async def handle_private_text(update: Update, context: ContextTypes.DEFAULT_TYPE
     if text == MENU_RETRIEVE:
         await send_policy_pdf(update, context)
         return
-    if text == MENU_SUMMARY:
-        await send_policy_summary_text(update, context)
-        return
     if text == MENU_SUBMIT:
         if existing:
             pending_submission[user_id] = {"details": None, "file": None}
@@ -390,85 +386,6 @@ async def send_policy_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         filename=f"{safe_name} - Policy Summary.pdf",
         caption=f"Your current policy summary, prepared by {settings.agent_name}.",
     )
-
-
-def _fmt_money(value, decimals: int = 2):
-    # Duplicated from bot.py's own _fmt_money rather than imported - see the
-    # module docstring on why this file stays fully separate from bot.py.
-    if value in (None, ""):
-        return None
-    if isinstance(value, (int, float)):
-        return f"${value:,.{decimals}f}"
-    return str(value)
-
-
-def _format_client_facing_summary(summary: dict) -> str:
-    # A trimmed version of bot.py's _format_client_summary: same policy/
-    # coverage/premium numbers, but deliberately WITHOUT action_items -
-    # those are Nic's own sales-facing next-step notes ("recommend adding
-    # CI cover"), not copy that should go straight to the client.
-    lines = [summary["client_name"]]
-    policies = summary.get("policies") or []
-    if not policies:
-        lines.append("")
-        lines.append("No policies logged yet.")
-        return "\n".join(lines)
-
-    lines.append("")
-    lines.append(f"{len(policies)} polic{'y' if len(policies) == 1 else 'ies'}:")
-    for p in policies:
-        company = p.get("company") or "?"
-        plan = p.get("plan_type") or "Plan"
-        lines.append(f"\n• {company} — {plan}")
-        if p.get("policy_no"):
-            lines.append(f"  {p['policy_no']}")
-        premium_cash = _fmt_money(p.get("premium_cash"))
-        premium_cpf = _fmt_money(p.get("premium_cpf"))
-        premium_bits = [f"{v} cash" if k == "cash" else f"{v} CPF"
-                         for k, v in (("cash", premium_cash), ("cpf", premium_cpf)) if v]
-        if premium_bits:
-            lines.append(f"  Premium: {' + '.join(premium_bits)}/yr")
-        death_cov = _fmt_money(p.get("death_coverage"), 0)
-        ci_cov = _fmt_money(p.get("ci_coverage"), 0)
-        coverage_bits = [f"Death {death_cov}" if death_cov else None, f"CI {ci_cov}" if ci_cov else None]
-        coverage_bits = [b for b in coverage_bits if b]
-        if coverage_bits:
-            lines.append(f"  Coverage: {', '.join(coverage_bits)}")
-
-    totals = summary.get("totals") or {}
-    total_cash = _fmt_money(totals.get("premium_cash"))
-    total_cpf = _fmt_money(totals.get("premium_cpf"))
-    total_bits = [f"{v} cash" if k == "cash" else f"{v} CPF"
-                   for k, v in (("cash", total_cash), ("cpf", total_cpf)) if v]
-    if total_bits:
-        lines.append(f"\nTotal annual premium: {' + '.join(total_bits)}")
-
-    return "\n".join(lines)
-
-
-async def send_policy_summary_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # The fast, no-file version of send_policy_pdf: same underlying data
-    # (services/policy_workbook.get_client_summary), just formatted as a
-    # quick chat message instead of a PDF attachment.
-    if not _is_private(update):
-        return
-    user_id = update.effective_user.id
-    client_name = await client_pairing.get_paired_client(user_id)
-    if not client_name:
-        await _offer_self_pairing(update)
-        return
-
-    try:
-        summary = await asyncio.to_thread(policy_workbook.get_client_summary, client_name)
-    except policy_workbook.PolicyWorkbookError as exc:
-        await update.message.reply_text(str(exc))
-        return
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("Failed to load client summary for %s", client_name)
-        await update.message.reply_text(f"Sorry, I couldn't pull up your policy summary right now: {exc}")
-        return
-
-    await update.message.reply_text(_format_client_facing_summary(summary))
 
 
 # ---------------------------------------------------------------------------
@@ -1066,8 +983,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.message.reply_text(
             "I can:\n"
             "- Book a meeting on your agent's calendar, just /book_meeting\n"
-            "- Show a quick text summary of your policies\n"
-            "- Send your full policy summary as a PDF\n"
+            "- Send your policy summary as a PDF\n"
             "- Pass along a document you send me straight to your agent\n"
             "- Refer a friend, just /refer\n"
             "- Give you a personal invite link to share with friends, just /invite\n\n"
