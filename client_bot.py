@@ -91,6 +91,19 @@ MENU_HELP = "❓ Help"
 # text typed while some other pending state (e.g. a referral) is open.
 MENU_TEXTS = {MENU_RETRIEVE, MENU_SUMMARY, MENU_SUBMIT, MENU_REFER, MENU_INVITE, MENU_BOOK, MENU_HELP}
 
+# The Wealth Circle channel's pinned "message my bot" link is a plain
+# t.me/<bot>?start=GENERIC_LINK_START_PAYLOAD deep link (not tied to any
+# one client). Telegram only auto-fires /start on a link click if it's a
+# deep link with a payload - a bare t.me/<bot> link just opens the chat
+# as-is, silently leaving a returning client's UI stuck on whatever
+# keyboard their last exchange with the bot left behind (which is how a
+# client who last talked to us months ago can still be looking at a
+# long-superseded menu). This payload exists purely to force a fresh
+# /start - and therefore a fresh, current keyboard - every time, so it's
+# special-cased below to skip pairing-code redemption rather than fail
+# with "That code isn't valid".
+GENERIC_LINK_START_PAYLOAD = "hi"
+
 # Meeting-booking state, keyed by Telegram user id (every user books their
 # own meeting independently - no chat_id collisions to worry about since
 # this is DM-only, but user id is used rather than chat_id/DM id on general
@@ -168,6 +181,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
 
     code = context.args[0] if context.args else None
+    if code == GENERIC_LINK_START_PAYLOAD:
+        code = None
     if code:
         try:
             client_name = await client_pairing.redeem_code(code, user_id)
