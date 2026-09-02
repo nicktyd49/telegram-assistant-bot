@@ -93,11 +93,12 @@ MENU_SUBMIT = "📤 Submit a Document"
 MENU_REFER = "🤝 Refer a Friend"
 MENU_INVITE = "🔗 Invite Friends"
 MENU_BOOK = "📅 Book a Meeting"
+MENU_FEEDBACK = "💬 Feedback"
 MENU_HELP = "❓ Help"
 
 # Every menu button label, used to tell a real menu tap apart from free
 # text typed while some other pending state (e.g. a referral) is open.
-MENU_TEXTS = {MENU_RETRIEVE, MENU_SUBMIT, MENU_REFER, MENU_INVITE, MENU_BOOK, MENU_HELP}
+MENU_TEXTS = {MENU_RETRIEVE, MENU_SUBMIT, MENU_REFER, MENU_INVITE, MENU_BOOK, MENU_FEEDBACK, MENU_HELP}
 
 # The Wealth Circle channel's pinned "message my bot" link is a plain
 # t.me/<bot>?start=GENERIC_LINK_START_PAYLOAD deep link (not tied to any
@@ -123,6 +124,11 @@ pending_meeting: dict[int, dict] = {}
 # client to reply with a friend's name/number. Not pairing-gated, same
 # reasoning as booking - referring a friend isn't sensitive.
 pending_referral: dict[int, bool] = {}
+
+# Feedback state, keyed by Telegram user id: True while waiting for the
+# client to reply with whatever they want to say. Same shape as
+# pending_referral, same "just relay the next free-text reply" pattern.
+pending_feedback: dict[int, bool] = {}
 
 # Document-submission state, keyed by Telegram user id: holds whatever of
 # {file, Name/DOB details} has arrived so far, since a client may attach
@@ -166,7 +172,7 @@ def _menu_keyboard() -> ReplyKeyboardMarkup:
     # Only ever shown to a paired client - see _offer_self_pairing() for
     # the unpaired experience, which has no keyboard of its own at all.
     return ReplyKeyboardMarkup(
-        [[MENU_RETRIEVE, MENU_SUBMIT], [MENU_REFER, MENU_INVITE], [MENU_BOOK, MENU_HELP]],
+        [[MENU_RETRIEVE, MENU_SUBMIT], [MENU_REFER, MENU_INVITE], [MENU_BOOK, MENU_FEEDBACK], [MENU_HELP]],
         resize_keyboard=True,
     )
 
@@ -185,6 +191,7 @@ def _menu_intro_text() -> str:
         f"{MENU_REFER} — pass along a friend's name and number\n"
         f"{MENU_INVITE} — get your own link to invite friends to the Wealth Circle channel\n"
         f"{MENU_BOOK} — check {settings.agent_name}'s calendar and book a meeting\n"
+        f"{MENU_FEEDBACK} — tell {settings.agent_name} what's working or what isn't\n"
         f"{MENU_HELP} — see this list again anytime"
     )
 
@@ -323,6 +330,10 @@ async def handle_private_text(update: Update, context: ContextTypes.DEFAULT_TYPE
         await _handle_referral_reply(update, context, text)
         return
 
+    if user_id in pending_feedback and text not in MENU_TEXTS:
+        await _handle_feedback_reply(update, context, text)
+        return
+
     if user_id in pending_submission and text not in MENU_TEXTS:
         await _handle_submission_details(update, context, text)
         return
@@ -332,6 +343,9 @@ async def handle_private_text(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
     if text == MENU_REFER:
         await start_referral(update, context)
+        return
+    if text == MENU_FEEDBACK:
+        await start_feedback(update, context)
         return
 
     existing = await client_pairing.get_paired_client(user_id)
@@ -453,6 +467,49 @@ async def _handle_referral_reply(update: Update, context: ContextTypes.DEFAULT_T
         return
 
     await update.message.reply_text(f"Thanks! I've passed that along to {settings.agent_name}.")
+
+
+# ---------------------------------------------------------------------------
+# Feedback - same "hold a flag, relay the next free-text reply" shape as
+# Refer a Friend above, just aimed at Nic himself instead of a lead.
+# ---------------------------------------------------------------------------
+
+async def start_feedback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_private(update):
+        return
+    user_id = update.effective_user.id
+    existing = await client_pairing.get_paired_client(user_id)
+    if not existing:
+        await _offer_self_pairing(update)
+        return
+    pending_feedback[user_id] = True
+    await update.message.reply_text(
+        f"What's on your mind? Anything you send here goes straight to {settings.agent_name} - "
+        "praise, a bug report, a suggestion, anything."
+    )
+
+
+async def feedback_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await start_feedback(update, context)
+
+
+async def _handle_feedback_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+    user_id = update.effective_user.id
+    pending_feedback.pop(user_id, None)
+    client_name = await client_pairing.get_paired_client(user_id)
+    label = client_name or _client_label(update.effective_user)
+
+    try:
+        await context.bot.send_message(
+            chat_id=settings.allowed_user_id,
+            text=f"💬 Feedback from {label} via the client bot:\n{text}",
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Failed to relay feedback from %s to Nic", label)
+        await update.message.reply_text(f"Sorry, that didn't go through: {exc}. Please try again in a moment.")
+        return
+
+    await update.message.reply_text(f"Thanks for letting {settings.agent_name} know!")
 
 
 async def send_invite_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -999,13 +1056,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             await _offer_self_pairing(update)
             return
         await update.message.reply_text(
-            "I can:\n"
-            "- Book a meeting on your agent's calendar, just /book_meeting\n"
-            "- Send your policy summary as a PDF\n"
-            "- Pass along a document you send me straight to your agent\n"
-            "- Refer a friend, just /refer\n"
-            "- Give you a personal invite link to share with friends, just /invite\n\n"
-            "Use the menu below any time.",
+            _menu_intro_text(),
             # Re-attaching the current keyboard here (not just in start()) means Help
             # doubles as a self-heal: if a client's keyboard is ever stuck on an old/
             # incomplete menu, just tapping Help fixes it.
@@ -1075,6 +1126,7 @@ def main() -> None:
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("book_meeting", book_meeting_command))
     app.add_handler(CommandHandler("refer", refer_command))
+    app.add_handler(CommandHandler("feedback", feedback_command))
     app.add_handler(CommandHandler("invite", invite_command))
     app.add_handler(CallbackQueryHandler(meeting_callback, pattern=r"^m(day|slot|page):"))
     app.add_handler(CallbackQueryHandler(handle_approve_send, pattern=r"^approve_send:"))
