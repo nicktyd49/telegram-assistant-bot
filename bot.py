@@ -1433,20 +1433,31 @@ async def _extract_and_fill_policy_summary_from_image(
     Previously a photo just got a one-off text summary in chat with nothing
     saved anywhere, which is not what "log this policy" should do just
     because it arrived as a photo instead of a PDF."""
-    response = await anthropic_client.messages.create(
-        model=settings.extraction_model,
-        max_tokens=768,
-        system=POLICY_FIELDS_EXTRACTION_PROMPT,
-        messages=[
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": image_b64}},
-                    {"type": "text", "text": "Photo of a policy document — extract the fields as JSON."},
-                ],
-            }
-        ],
-    )
+    try:
+        response = await anthropic_client.messages.create(
+            model=settings.extraction_model,
+            max_tokens=768,
+            system=POLICY_FIELDS_EXTRACTION_PROMPT,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": image_b64}},
+                        {"type": "text", "text": "Photo of a policy document — extract the fields as JSON."},
+                    ],
+                }
+            ],
+        )
+    except Exception as exc:  # noqa: BLE001
+        # Belt-and-suspenders: the global error_handler would also catch this,
+        # but a client/Nic staring at silence while the alert makes its way
+        # through is exactly the "bot goes quiet with no error" failure mode
+        # this whole error-handling effort was about. Reply here directly too.
+        logger.exception("Policy extraction call failed for a photo")
+        await update.message.reply_text(
+            f"Something went wrong reading that photo: {exc}. Try again, or send it as a PDF instead."
+        )
+        return
     raw = "".join(b.text for b in response.content if b.type == "text").strip()
     fields = _parse_json_block(raw)
     if fields is None:
