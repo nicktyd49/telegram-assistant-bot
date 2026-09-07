@@ -1303,6 +1303,18 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     image_b64 = base64.b64encode(image_bytes).decode("ascii")
 
     if "policy" in caption:
+        is_policy = True
+    elif "receipt" in caption:
+        is_policy = False
+    else:
+        # No caption to go on. This used to fall straight through to
+        # "receipt" - which is exactly how a photographed policy summary
+        # sent with no caption got silently logged as a receipt with
+        # garbage fields. Ask Claude to actually look at the photo instead
+        # of guessing blind.
+        is_policy = await _classify_photo_as_policy(image_b64)
+
+    if is_policy:
         await _summarize_policy_from_image(update, image_b64)
     else:
         await _extract_and_log_receipt_from_image(update, image_b64)
@@ -1329,6 +1341,37 @@ async def handle_generic_document(update: Update, context: ContextTypes.DEFAULT_
         "I can only read PDFs and photos for policy/receipt logging. To just save a file for a "
         "client, tap 🗂 File Client Items first."
     )
+
+
+async def _classify_photo_as_policy(image_b64: str) -> bool:
+    """Called only when a photo arrives with no "policy"/"receipt" caption
+    to go on. Asks Claude to actually look at the image and classify it,
+    rather than defaulting blind to receipt (see handle_photo)."""
+    try:
+        response = await anthropic_client.messages.create(
+            model=settings.extraction_model,
+            max_tokens=8,
+            system=(
+                "You classify a photographed document. Reply with exactly one word, "
+                "nothing else: 'policy' if it's an insurance policy document, illustration, "
+                "or policy summary sheet; 'receipt' if it's a purchase receipt, invoice, or "
+                "payment slip. If genuinely unsure, reply 'receipt'."
+            ),
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": image_b64}},
+                        {"type": "text", "text": "policy or receipt?"},
+                    ],
+                }
+            ],
+        )
+        answer = "".join(b.text for b in response.content if b.type == "text").strip().lower()
+        return "policy" in answer
+    except Exception:  # noqa: BLE001
+        logger.exception("Photo classification call failed - defaulting to receipt")
+        return False
 
 
 async def _summarize_policy_from_image(update: Update, image_b64: str) -> None:
