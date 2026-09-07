@@ -247,8 +247,44 @@ def _format_event_lines(events: list[dict]) -> list[str]:
     return lines
 
 
+def _format_events_grouped_by_day(events: list[dict], start_date: str, end_date: str) -> list[str]:
+    """Buckets events under a bold heading for each calendar day in
+    [start_date, end_date] - so a multi-day range (e.g. "This Week") reads
+    as a week laid out day by day, instead of one flat list with no sense
+    of which events fall on which day. Days with nothing scheduled still
+    get a heading, so the empty stretches of the week are visible too."""
+    by_day: dict[str, list[dict]] = {}
+    for e in events:
+        start = e.get("start", {}).get("dateTime", e.get("start", {}).get("date", "?"))
+        try:
+            day_key = datetime.fromisoformat(start).date().isoformat()
+        except ValueError:
+            day_key = start[:10]
+        by_day.setdefault(day_key, []).append(e)
+
+    start_d = date.fromisoformat(start_date)
+    end_d = date.fromisoformat(end_date)
+
+    lines: list[str] = []
+    d = start_d
+    while d <= end_d:
+        day_events = by_day.get(d.isoformat(), [])
+        lines.append(f"\n*{d.strftime('%A, %-d %b')}*")
+        if day_events:
+            day_events_sorted = sorted(
+                day_events,
+                key=lambda e: e.get("start", {}).get("dateTime", e.get("start", {}).get("date", "")),
+            )
+            lines.extend(_format_event_lines(day_events_sorted))
+        else:
+            lines.append("- Nothing scheduled")
+        d += timedelta(days=1)
+    return lines
+
+
 async def _reply_events_for_range(message, start_date: str, end_date: str,
-                                   header: str, empty_text: str) -> None:
+                                   header: str, empty_text: str,
+                                   group_by_day: bool = False) -> None:
     if not settings.calendar_configured:
         await message.reply_text("Calendar isn't set up yet — see the README to connect it.")
         return
@@ -257,6 +293,14 @@ async def _reply_events_for_range(message, start_date: str, end_date: str,
     except Exception as exc:  # noqa: BLE001
         logger.exception("calendar range fetch failed")
         await message.reply_text(f"Couldn't load your calendar: {exc}")
+        return
+
+    if group_by_day:
+        # Show every day in the range (even empty ones) so the whole week's
+        # shape is visible, rather than bailing out to empty_text just
+        # because a couple of days have nothing on them.
+        lines = [header] + _format_events_grouped_by_day(events, start_date, end_date)
+        await message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
         return
 
     if not events:
@@ -903,6 +947,7 @@ async def calendar_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         start, end = _week_range(today)
         await _reply_events_for_range(
             query.message, start, end, "*This week*", "Nothing on your calendar this week.",
+            group_by_day=True,
         )
     elif action in ("free_today", "free_tomorrow"):
         day = today if action == "free_today" else today + timedelta(days=1)

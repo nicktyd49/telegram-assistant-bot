@@ -70,7 +70,10 @@ tool, report back to the user in plain, friendly language (never raw JSON or IDs
 may mention an event time/title to confirm). If a tool call fails, tell the user what went
 wrong in one sentence rather than a stack trace. Resolve relative dates ("tomorrow", "next
 Tuesday") against the current date/time above and always pass full ISO 8601 datetimes with
-the {settings.timezone} UTC offset to calendar tools."""
+the {settings.timezone} UTC offset to calendar tools. When list_calendar_events returns events
+spanning more than one day (e.g. "this week", "next few days"), organize your reply under a
+heading for each day (e.g. "Monday, 8 Sep") rather than one flat list — that's how a week
+should read back to the user."""
 
 
 def _build_tools() -> list[dict]:
