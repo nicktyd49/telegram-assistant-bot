@@ -27,7 +27,7 @@ from telegram.ext import (
 from config import settings
 from assistant import anthropic_client, run_conversation
 from services import calendar_service, sheets_service, pdf_utils, policy_workbook, policy_illustration, onedrive_service, action_plan, client_pairing, news_service, poster_service, ig_post_service
-from prompts import POLICY_SUMMARY_PROMPT, RECEIPT_EXTRACTION_PROMPT, POLICY_FIELDS_EXTRACTION_PROMPT
+from prompts import RECEIPT_EXTRACTION_PROMPT, POLICY_FIELDS_EXTRACTION_PROMPT
 
 MAX_HISTORY_MESSAGES = 40
 MAX_POLICY_TEXT_CHARS = 15000
@@ -1344,7 +1344,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         # prompt's ✅ Create Post button (or typing "done") finishes the session.
         return
 
-    caption = (update.message.caption or "").lower()
+    caption_raw = (update.message.caption or "").strip()
+    caption = caption_raw.lower()
     image_b64 = base64.b64encode(image_bytes).decode("ascii")
 
     if "policy" in caption:
@@ -1360,7 +1361,10 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         is_policy = await _classify_photo_as_policy(image_b64)
 
     if is_policy:
-        await _summarize_policy_from_image(update, image_b64)
+        client_override = caption_raw if (caption_raw and caption != "policy") else None
+        await _extract_and_fill_policy_summary_from_image(
+            update, image_b64, client_name_override=client_override,
+        )
     else:
         await _extract_and_log_receipt_from_image(update, image_b64)
 
@@ -1419,24 +1423,54 @@ async def _classify_photo_as_policy(image_b64: str) -> bool:
         return False
 
 
-async def _summarize_policy_from_image(update: Update, image_b64: str) -> None:
+async def _extract_and_fill_policy_summary_from_image(
+    update: Update, image_b64: str, client_name_override: str | None = None,
+) -> None:
+    """Photo equivalent of _extract_and_fill_policy_summary: pulls the same
+    structured fields straight out of the image (instead of PDF text) and
+    files them the same way — added to the client's workbook, illustration/
+    action-plan sheets rebuilt, and a confirmation + workbook PDF sent back.
+    Previously a photo just got a one-off text summary in chat with nothing
+    saved anywhere, which is not what "log this policy" should do just
+    because it arrived as a photo instead of a PDF."""
     response = await anthropic_client.messages.create(
         model=settings.extraction_model,
-        max_tokens=1024,
-        system=POLICY_SUMMARY_PROMPT,
+        max_tokens=768,
+        system=POLICY_FIELDS_EXTRACTION_PROMPT,
         messages=[
             {
                 "role": "user",
                 "content": [
                     {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": image_b64}},
-                    {"type": "text", "text": "Photo of a policy document — please summarize it."},
+                    {"type": "text", "text": "Photo of a policy document — extract the fields as JSON."},
                 ],
             }
         ],
     )
-    summary = "".join(b.text for b in response.content if b.type == "text").strip()
-    await update.message.reply_text(summary or "I couldn't produce a summary from this image.",
-                                     parse_mode=ParseMode.MARKDOWN)
+    raw = "".join(b.text for b in response.content if b.type == "text").strip()
+    fields = _parse_json_block(raw)
+    if fields is None:
+        await update.message.reply_text(
+            "I couldn't extract structured fields from that photo — try a clearer shot, or "
+            "send it as a PDF instead."
+        )
+        return
+
+    client_name = (client_name_override or fields.get("client_name") or "").strip()
+    if not client_name:
+        pending_policy[update.effective_chat.id] = {"fields": fields, "pdf_bytes": None, "pdf_filename": None}
+        recent = _recent_clients()
+        keyboard = _client_picker_keyboard(recent)
+        prompt = "I couldn't find the client's name in this photo — who is this policy for? "
+        prompt += (
+            "Tap an existing client below, or just reply with a name."
+            if keyboard else
+            "Just reply with their name and I'll file it under them."
+        )
+        await update.message.reply_text(prompt, reply_markup=keyboard)
+        return
+
+    await _finish_policy_summary(update.message, client_name, fields)
 
 
 def _parse_json_block(raw_text: str) -> dict | None:
