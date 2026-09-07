@@ -1085,6 +1085,13 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
     if isinstance(context.error, telegram.error.RetryAfter):
         logger.warning("Telegram flood control hit (retry_after=%s) — not re-notifying, it's not actionable per-occurrence", context.error.retry_after)
         return
+    if isinstance(context.error, telegram.error.BadRequest) and "Query is too old" in str(context.error):
+        # A button tap whose callback query Telegram invalidated before the bot
+        # answered it — almost always because the container was mid-redeploy
+        # (same class of transient issue as the Conflict case above). Not
+        # actionable beyond "tap it again", so log but don't alert.
+        logger.info("Stale callback query (likely tapped during a redeploy) — not re-notifying")
+        return
     logger.error("Unhandled exception while processing an update", exc_info=context.error)
     try:
         trace = "".join(
