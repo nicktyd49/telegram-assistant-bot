@@ -210,7 +210,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         ),
         "- /today — today's schedule",
         "- /undo — remove the most recently logged receipt (in case of a misread)",
-        "- /client <name> — pull up a client policy summary in chat (numbers, coverage, gap notes)",
+        "- /client <name> — pull up a client policy summary in chat (numbers, coverage, gap notes) and get the PDF",
         "- /client_code <name> — generate a one-time pairing code so a client can link the client bot to their own policy summary",
         "- /news — on-demand insurance news digest (Singapore-focused)",
         "- 📊 Market Poster (button below) — turn your fund house talk notes into a "
@@ -799,6 +799,24 @@ async def client_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     await update.message.reply_text(_format_client_summary(summary))
+
+    await update.message.reply_chat_action("upload_document")
+    try:
+        pdf_bytes = await policy_workbook.get_client_facing_pdf(client_name)
+    except policy_workbook.PolicyWorkbookError as exc:
+        await update.message.reply_text(f"(Couldn't attach the PDF: {exc})")
+        return
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Failed to build client-facing PDF for %s", client_name)
+        await update.message.reply_text(f"(Couldn't attach the PDF: {exc})")
+        return
+
+    safe_name = "".join(c for c in client_name if c not in '<>:"/\\|?*').strip()
+    await update.message.reply_document(
+        document=BytesIO(pdf_bytes),
+        filename=f"{safe_name} - Policy Summary.pdf",
+        caption=f"{client_name}'s policy summary PDF.",
+    )
 
 
 async def onedrive_setup_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
