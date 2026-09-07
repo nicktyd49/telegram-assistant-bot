@@ -1468,6 +1468,8 @@ async def _extract_and_fill_policy_summary_from_image(
         return
 
     client_name = (client_name_override or fields.get("client_name") or "").strip()
+    if client_name:
+        client_name = await _canonicalize_client_name(client_name, update.effective_chat.id)
     if not client_name:
         pending_policy[update.effective_chat.id] = {"fields": fields, "pdf_bytes": None, "pdf_filename": None}
         recent = _recent_clients()
@@ -1541,6 +1543,45 @@ def _format_policy_reply(client_name: str, fields: dict, policy_count: int) -> s
     return "\n".join(lines)
 
 
+def _normalize_name_key(name: str) -> str:
+    return " ".join(name.split()).casefold()
+
+
+async def _canonicalize_client_name(candidate: str, chat_id: int) -> str:
+    """Matches a freshly-extracted client name against names already known
+    for this client, case/whitespace-insensitively, and returns the KNOWN
+    spelling instead of the new variant when one matches.
+
+    Without this, two photos of the same multi-page policy that OCR'd the
+    client's name as e.g. "Tan Wei Ming" and "tan wei ming" (or with an
+    extra space) would silently become two different clients — two
+    different OneDrive folders/workbooks, and (within one batch session)
+    two separate compiled PDFs sent instead of one. Checks the clients
+    already touched in this batch session first (cheap, in-memory), then
+    falls back to the full OneDrive client list (best-effort — a failure
+    here just means no cross-check, not a broken filing)."""
+    candidate = candidate.strip()
+    if not candidate:
+        return candidate
+    key = _normalize_name_key(candidate)
+
+    session = pending_policy_session.get(chat_id)
+    if session:
+        for known in session.keys():
+            if _normalize_name_key(known) == key:
+                return known
+
+    try:
+        all_clients = await policy_workbook.list_client_names()
+    except Exception:  # noqa: BLE001
+        logger.exception("Couldn't fetch client list for name canonicalization — proceeding without it")
+        return candidate
+    for known in all_clients:
+        if _normalize_name_key(known) == key:
+            return known
+    return candidate
+
+
 async def _extract_and_fill_policy_summary(
     update: Update, text: str, client_name_override: str | None = None,
     pdf_bytes: bytes | None = None, pdf_filename: str | None = None,
@@ -1562,6 +1603,8 @@ async def _extract_and_fill_policy_summary(
         return
 
     client_name = (client_name_override or fields.get("client_name") or "").strip()
+    if client_name:
+        client_name = await _canonicalize_client_name(client_name, update.effective_chat.id)
     if not client_name:
         pending_policy[update.effective_chat.id] = {
             "fields": fields, "pdf_bytes": pdf_bytes, "pdf_filename": pdf_filename,
