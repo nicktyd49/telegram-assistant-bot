@@ -26,7 +26,7 @@ from telegram.ext import (
 
 from config import settings
 from assistant import anthropic_client, run_conversation
-from services import calendar_service, sheets_service, pdf_utils, policy_workbook, policy_illustration, onedrive_service, action_plan, client_pairing, news_service, poster_service, ig_post_service
+from services import calendar_service, sheets_service, pdf_utils, policy_workbook, policy_illustration, onedrive_service, action_plan, client_pairing, news_service, poster_service, ig_post_service, fund_price_service, fund_update_workbook
 from prompts import RECEIPT_EXTRACTION_PROMPT, POLICY_FIELDS_EXTRACTION_PROMPT
 
 MAX_HISTORY_MESSAGES = 40
@@ -46,6 +46,7 @@ MENU_HELP = "❓ Help"
 MENU_NEWS = "📰 News"
 MENU_POSTER = "📊 Market Poster"
 MENU_IG = "📸 IG Post"
+MENU_FUND_UPDATE = "📈 Fund Update"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("assistant-bot")
@@ -89,6 +90,20 @@ pending_poster_preview: dict[int, dict] = {}
 pending_ig_session: dict[int, dict] = {}
 pending_ig_preview: dict[int, dict] = {}
 
+# In-memory per-chat "Fund Update" session state (ILP Funds Update report).
+# Maps chat_id -> {
+#   "step": str,                # which question we're waiting on, see handle_message
+#   "data": {...},              # client_name, product, policy_number, commencement_date,
+#                               # total_invested, account_value, account_value_asof,
+#                               # ref_illustration
+#   "funds": [{"name","code","currency","allocation_pct"}, ...],
+#   "pending_fund" / "pending_fund_name": the fund currently mid-entry, if any
+#   "remarks": [str, ...] | absent
+# }
+# Fund prices are fetched live from HSBC only once the whole session is
+# complete (see _build_fund_update) — nothing is fetched question-by-question.
+pending_fund_update_session: dict[int, dict] = {}
+
 
 def _trim_history(history: list[dict]) -> None:
     """Drops old turns from the front, but only ever starting the kept
@@ -109,10 +124,33 @@ def _is_allowed(update: Update) -> bool:
     return True
 
 
+def _parse_date(text: str) -> date | None:
+    """Accepts DD/MM/YYYY, DD-MM-YYYY, or the word 'today' — used throughout
+    the Fund Update wizard, which asks for dates in Nic's usual DD/MM/YYYY."""
+    text = text.strip()
+    if text.lower() == "today":
+        return date.today()
+    for fmt in ("%d/%m/%Y", "%d-%m-%Y", "%d/%m/%y"):
+        try:
+            return datetime.strptime(text, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def _parse_amount(text: str) -> float | None:
+    cleaned = text.strip().replace(",", "").replace("$", "")
+    try:
+        return float(cleaned)
+    except ValueError:
+        return None
+
+
 def main_menu_keyboard() -> ReplyKeyboardMarkup:
     """The persistent row of buttons at the bottom of the chat."""
     return ReplyKeyboardMarkup(
-        [[MENU_CALENDAR, MENU_RECEIPT], [MENU_POLICY, MENU_FILE], [MENU_NEWS, MENU_POSTER], [MENU_IG, MENU_HELP]],
+        [[MENU_CALENDAR, MENU_RECEIPT], [MENU_POLICY, MENU_FILE], [MENU_NEWS, MENU_POSTER],
+         [MENU_IG, MENU_FUND_UPDATE], [MENU_HELP]],
         resize_keyboard=True,
     )
 
@@ -219,6 +257,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "(picking the best 5-10 as a carousel if you send a lot) and write one caption — no "
         "auto-posting, just save the photo(s) and copy the caption yourself (no Instagram "
         "connection from here).",
+        "- 📈 Fund Update (button below) - walks you through a client's ILP policy and "
+        "fund allocations, fetches live fund prices from HSBC, and builds + saves the "
+        "ILP Funds Update report to OneDrive.",
         "- /onedrive_setup — connect OneDrive so client files and archived PDFs are backed up" + (
             " (already connected)" if settings.onedrive_token_cache else ""
         ),
@@ -1050,6 +1091,130 @@ async def _menu_ig(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+def _done_fund_keyboard() -> InlineKeyboardMarkup:
+    """Shown once at least one fund has been added to an active Fund Update session."""
+    return InlineKeyboardMarkup([[InlineKeyboardButton("✅ Done Adding Funds", callback_data="funddone")]])
+
+
+async def _menu_fund_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Starts an 'ILP Funds Update' session - walks through the policy
+    details and fund allocations in chat, fetches live NAV from HSBC for
+    commencement / 1st-anniversary / today, builds the report and saves it
+    straight to OneDrive under Client/<name>/, same as Policy Summary does."""
+    chat_id = update.effective_chat.id
+    pending_policy.pop(chat_id, None)
+    pending_policy_session.pop(chat_id, None)
+    pending_client_files.pop(chat_id, None)
+    pending_poster_session.pop(chat_id, None)
+    pending_poster_preview.pop(chat_id, None)
+    pending_ig_session.pop(chat_id, None)
+    pending_ig_preview.pop(chat_id, None)
+    pending_fund_update_session[chat_id] = {"step": "client_name", "data": {}, "funds": []}
+    await update.message.reply_text("Who's this ILP Funds Update for? Send the client's name.")
+
+
+async def _finish_fund_list(message, chat_id: int) -> None:
+    state = pending_fund_update_session.get(chat_id)
+    if not state or not state.get("funds"):
+        await message.reply_text("Add at least one fund before finishing — send a fund name.")
+        return
+    state["step"] = "remarks"
+    names = ", ".join(f["name"] for f in state["funds"])
+    await message.reply_text(
+        f"Got {len(state['funds'])} fund(s): {names}.\n\n"
+        "Any remarks/notes to attach per fund, in the same order? Send them separated by commas "
+        "or on separate lines, or type skip."
+    )
+
+
+async def fund_done_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not _is_allowed(update):
+        await query.answer()
+        return
+    await query.answer()
+    await _finish_fund_list(query.message, update.effective_chat.id)
+
+
+async def _build_fund_update(message, chat_id: int) -> None:
+    """Fetches live prices for every fund in the session, builds the
+    workbook, saves it to OneDrive, and sends it back on Telegram. Pops the
+    session either way so a failure doesn't leave the chat stuck."""
+    state = pending_fund_update_session.pop(chat_id, None)
+    if not state:
+        return
+    data = state["data"]
+    funds_in = state["funds"]
+    remarks = state.get("remarks") or []
+
+    await message.chat.send_action("typing")
+    await message.reply_text(f"Fetching live prices for {len(funds_in)} fund(s) from HSBC — one moment...")
+
+    commencement = data["commencement_date"]
+    try:
+        anniversary = date(commencement.year + 1, commencement.month, commencement.day)
+    except ValueError:
+        anniversary = commencement + timedelta(days=365)
+    current = date.today()
+
+    fund_rows = []
+    errors = []
+    for i, f in enumerate(funds_in):
+        try:
+            prices = fund_price_service.fetch_prices(f["code"], f["currency"], [commencement, anniversary, current])
+        except fund_price_service.FundPriceError as exc:
+            errors.append(f"{f['name']}: {exc}")
+            continue
+        display_name = f["name"] if "(" in f["name"] else f"{f['name']} ({f['currency']})"
+        fund_rows.append(fund_update_workbook.FundRow(
+            name=display_name,
+            allocation_pct=f["allocation_pct"],
+            price_commencement=prices[commencement].value,
+            price_anniversary=prices[anniversary].value,
+            price_current=prices[current].value,
+            remark=remarks[i] if i < len(remarks) else None,
+        ))
+
+    if errors:
+        await message.reply_text("Some funds couldn't be priced:\n" + "\n".join(errors))
+    if not fund_rows:
+        await message.reply_text("Couldn't build the report — no fund prices came back.", reply_markup=main_menu_keyboard())
+        return
+
+    wb_data = fund_update_workbook.FundUpdateData(
+        client_name=data["client_name"],
+        product=data["product"],
+        policy_number=data["policy_number"],
+        commencement_date=commencement,
+        anniversary_date=anniversary,
+        current_date=current,
+        total_invested=data["total_invested"],
+        account_value=data["account_value"],
+        account_value_asof=data["account_value_asof"],
+        funds=fund_rows,
+        ref_illustration=data.get("ref_illustration"),
+    )
+    xlsx_bytes = fund_update_workbook.build_fund_update_workbook(wb_data)
+    filename = fund_update_workbook._filename(data["client_name"])
+
+    saved_note = ""
+    try:
+        filename = await fund_update_workbook.save_to_onedrive(data["client_name"], xlsx_bytes)
+        saved_note = f"\n\nSaved to OneDrive under Client/{data['client_name']}/{filename}."
+    except onedrive_service.OneDriveNotConfigured:
+        saved_note = "\n\n(OneDrive isn't set up yet — run /onedrive_setup to have future reports saved there automatically.)"
+    except Exception:
+        logger.exception("Failed to save fund update workbook to OneDrive")
+        saved_note = "\n\n(Couldn't save to OneDrive this time — here's the file directly.)"
+
+    await message.reply_document(
+        document=BytesIO(xlsx_bytes),
+        filename=filename,
+        caption=f"ILP Funds Update — {data['client_name']}{saved_note}",
+        reply_markup=main_menu_keyboard(),
+    )
+
+
 # Persistent-keyboard button text -> handler. Checked first in handle_message
 # so tapping a button doesn't fall through to the general chat assistant.
 MENU_ACTIONS = {
@@ -1060,6 +1225,7 @@ MENU_ACTIONS = {
     MENU_NEWS: news_command,
     MENU_POSTER: _menu_poster,
     MENU_IG: _menu_ig,
+    MENU_FUND_UPDATE: _menu_fund_update,
     MENU_HELP: help_command,
 }
 
@@ -1149,6 +1315,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if text_raw != MENU_IG:
             pending_ig_session.pop(chat_id, None)
             pending_ig_preview.pop(chat_id, None)
+        if text_raw != MENU_FUND_UPDATE:
+            pending_fund_update_session.pop(chat_id, None)
         await MENU_ACTIONS[text_raw](update, context)
         return
 
@@ -1243,6 +1411,160 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             "Want another change? Just tell me, or tap 🔁 Regenerate for a fresh take.",
             reply_markup=_ig_review_keyboard(),
         )
+        return
+
+    if chat_id in pending_fund_update_session:
+        state = pending_fund_update_session[chat_id]
+        step = state["step"]
+        text = text_raw.strip()
+
+        if step == "client_name":
+            if not text:
+                await update.message.reply_text("Who's this fund update for? Send the client's name.")
+                return
+            state["data"]["client_name"] = text
+            state["step"] = "product"
+            await update.message.reply_text("What's the policy product? (e.g. HSBCLife Wealth Voyage)")
+            return
+
+        if step == "product":
+            state["data"]["product"] = text or "—"
+            state["step"] = "policy_number"
+            await update.message.reply_text("Policy number?")
+            return
+
+        if step == "policy_number":
+            state["data"]["policy_number"] = text or "—"
+            state["step"] = "commencement_date"
+            await update.message.reply_text("Commencement date? (DD/MM/YYYY)")
+            return
+
+        if step == "commencement_date":
+            d = _parse_date(text)
+            if d is None:
+                await update.message.reply_text("Couldn't read that date — please send it as DD/MM/YYYY.")
+                return
+            state["data"]["commencement_date"] = d
+            state["step"] = "total_invested"
+            await update.message.reply_text("Total amount invested? (just the number, e.g. 9600)")
+            return
+
+        if step == "total_invested":
+            v = _parse_amount(text)
+            if v is None:
+                await update.message.reply_text("Couldn't read that as a number — how much was invested in total?")
+                return
+            state["data"]["total_invested"] = v
+            state["step"] = "account_value"
+            await update.message.reply_text("Current account value?")
+            return
+
+        if step == "account_value":
+            v = _parse_amount(text)
+            if v is None:
+                await update.message.reply_text("Couldn't read that as a number — what's the current account value?")
+                return
+            state["data"]["account_value"] = v
+            state["step"] = "account_value_date"
+            await update.message.reply_text("As of what date? (DD/MM/YYYY, or send 'today')")
+            return
+
+        if step == "account_value_date":
+            d = _parse_date(text)
+            if d is None:
+                await update.message.reply_text("Couldn't read that date — please send it as DD/MM/YYYY, or 'today'.")
+                return
+            state["data"]["account_value_asof"] = d
+            state["step"] = "ref_illustration"
+            await update.message.reply_text(
+                "Ref policy illustration value, if you have one? (e.g. \"$13,911 (8% IRR)\"), or type skip."
+            )
+            return
+
+        if step == "ref_illustration":
+            state["data"]["ref_illustration"] = None if text.lower() == "skip" else text
+            state["step"] = "fund_name"
+            await update.message.reply_text(
+                "Now the funds. Send the first fund's name (e.g. BlackRock World Healthscience (USD))."
+            )
+            return
+
+        if step == "fund_name":
+            if text.lower() in {"done", "finish"}:
+                await _finish_fund_list(update.message, chat_id)
+                return
+            if not text:
+                await update.message.reply_text("Send a fund name, or type done if you're finished.")
+                return
+            resolved = fund_price_service.resolve_fund(text)
+            if resolved:
+                state["pending_fund"] = {
+                    "name": resolved.display_name, "code": resolved.code, "currency": resolved.currency,
+                }
+                state["step"] = "fund_allocation"
+                await update.message.reply_text(
+                    f"Found it — {resolved.display_name} ({resolved.currency}). What's its allocation %? (e.g. 25)"
+                )
+            else:
+                state["pending_fund_name"] = text
+                state["step"] = "awaiting_fund_code"
+                await update.message.reply_text(
+                    f"I don't have '{text}' in my fund directory yet. Reply with its security code and "
+                    "currency from the fund's page on fundprices.insurance.hsbc.com.sg, like "
+                    "`F0GBR04K8L USD`, or type skip to leave this fund out."
+                )
+            return
+
+        if step == "awaiting_fund_code":
+            if text.lower() == "skip":
+                state.pop("pending_fund_name", None)
+                state["step"] = "fund_name"
+                await update.message.reply_text("Okay, skipped. Send the next fund's name, or type done if that's all.")
+                return
+            parts = text.split()
+            if len(parts) != 2:
+                await update.message.reply_text(
+                    "That didn't look right — reply with just the code and currency, like `F0GBR04K8L USD`."
+                )
+                return
+            code, currency = parts
+            fund_name = state.pop("pending_fund_name", text)
+            fund_price_service.remember_fund(fund_name, code, currency)
+            state["pending_fund"] = {"name": fund_name, "code": code, "currency": currency.upper()}
+            state["step"] = "fund_allocation"
+            await update.message.reply_text(
+                f"Got it — saved {fund_name} ({currency.upper()}) for future reports. What's its allocation %?"
+            )
+            return
+
+        if step == "fund_allocation":
+            alloc = _parse_amount(text)
+            if alloc is None:
+                await update.message.reply_text("Couldn't read that as a number — what's this fund's allocation %?")
+                return
+            pending_fund = state.pop("pending_fund", None)
+            if pending_fund is None:
+                state["step"] = "fund_name"
+                await update.message.reply_text("Something went wrong — send the fund name again.")
+                return
+            pending_fund["allocation_pct"] = alloc
+            state["funds"].append(pending_fund)
+            state["step"] = "fund_name"
+            total_alloc = sum(f["allocation_pct"] for f in state["funds"])
+            await update.message.reply_text(
+                f"Added {pending_fund['name']} at {alloc:.0f}% ({total_alloc:.0f}% allocated so far). "
+                "Send the next fund's name, or tap Done if that's all.",
+                reply_markup=_done_fund_keyboard(),
+            )
+            return
+
+        if step == "remarks":
+            if text.lower() != "skip":
+                remark_list = [r.strip() for r in re.split(r"[,\n]", text) if r.strip()]
+                state["remarks"] = remark_list
+            await _build_fund_update(update.message, chat_id)
+            return
+
         return
 
     user_text = update.message.text
@@ -2081,6 +2403,7 @@ def main() -> None:
     app.add_handler(CommandHandler("news", news_command))
     app.add_handler(CommandHandler("poster", _menu_poster))
     app.add_handler(CommandHandler("igpost", _menu_ig))
+    app.add_handler(CommandHandler("fundupdate", _menu_fund_update))
     app.add_handler(CommandHandler("groupid", groupid_command))
     app.add_handler(CommandHandler("menu", menu_command))
     app.add_handler(CallbackQueryHandler(calendar_callback, pattern=r"^cal:"))
@@ -2094,6 +2417,7 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(ig_done_callback, pattern=r"^igdone$"))
     app.add_handler(CallbackQueryHandler(ig_regen_callback, pattern=r"^igregen$"))
     app.add_handler(CallbackQueryHandler(ig_discard_callback, pattern=r"^igdiscard$"))
+    app.add_handler(CallbackQueryHandler(fund_done_callback, pattern=r"^funddone$"))
     app.add_handler(MessageHandler(filters.Document.PDF, handle_policy_or_receipt_pdf))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.Document.ALL & ~filters.Document.PDF, handle_generic_document))
