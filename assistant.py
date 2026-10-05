@@ -14,7 +14,7 @@ from zoneinfo import ZoneInfo
 from anthropic import AsyncAnthropic
 
 from config import settings
-from services import calendar_service, sheets_service
+from services import calendar_service, sheets_service, sales_tracker_service
 
 logger = logging.getLogger("assistant-bot.assistant")
 
@@ -57,6 +57,24 @@ def build_system_prompt() -> str:
         capabilities.append(
             "- Receipt logging is NOT configured yet — if asked to log an expense, say so "
             "plainly and don't pretend to have done it."
+        )
+    if settings.sales_tracker_configured:
+        capabilities.append(
+            "- Logging a new lead to the Sales Tracker (Leads tab) via the log_lead tool, "
+            "and logging a closed/issued case to the Sales Tracker (Production tab) via the "
+            "log_case tool, whenever the user describes one in text (e.g. 'new lead John Tan "
+            "91234567 referral, proposing Wealth Accelerate ~$5k premium' or 'closed case "
+            "Mary Lim policy POL123456 Wealth Accelerate RP $5000 premium issued today'). "
+            "Pull out whatever fields are given and leave the rest blank rather than "
+            "guessing — only `name` is required for a lead, and `client_name`, "
+            "`policy_number`, and `issued_date` are required for a case (issued_date must be "
+            "a real date for the Dashboard numbers to pick it up — default to today if the "
+            "user doesn't give one). Confirm back exactly what was logged."
+        )
+    else:
+        capabilities.append(
+            "- Sales Tracker logging (leads/cases) is NOT configured yet — if asked to log "
+            "one, say so plainly and don't pretend to have done it."
         )
 
     return f"""You are a personal assistant for an insurance agent/broker, reachable via Telegram.
@@ -174,6 +192,63 @@ def _build_tools() -> list[dict]:
                 "input_schema": {"type": "object", "properties": {}},
             }
         )
+    if settings.sales_tracker_configured:
+        tools.append(
+            {
+                "name": "log_lead",
+                "description": (
+                    "Log a new lead to the Sales Tracker's Leads tab, when the user "
+                    "describes one in text (e.g. 'new lead John Tan 91234567 referral, "
+                    "proposing Wealth Accelerate ~$5k premium')."
+                ),
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "date": {"type": "string", "description": "ISO date the lead came in; default to today if unspecified."},
+                        "name": {"type": "string"},
+                        "contact": {"type": "string", "description": "Phone number."},
+                        "lead_source": {"type": "string", "description": "e.g. Referral, Friend, Existing Client, Roadshow, Cold Call, Social Media, Networking, Others."},
+                        "last_contact": {"type": "string", "description": "ISO date."},
+                        "next_follow_up": {"type": "string", "description": "ISO date."},
+                        "appointment_date": {"type": "string", "description": "ISO date."},
+                        "stage": {"type": "string", "description": "One of: New Lead, Contacted, Appointment, Fact Find, Proposal, Submitted, Issued, Lost. Default New Lead."},
+                        "proposed_plan": {"type": "string"},
+                        "potential_premium": {"type": "number"},
+                        "potential_eape": {"type": "number"},
+                        "potential_fyc": {"type": "number"},
+                        "remark": {"type": "string"},
+                    },
+                    "required": ["name"],
+                },
+            }
+        )
+        tools.append(
+            {
+                "name": "log_case",
+                "description": (
+                    "Log a closed/issued case to the Sales Tracker's Production tab, when "
+                    "the user describes one in text (e.g. 'closed case Mary Lim policy "
+                    "POL123456 Wealth Accelerate RP $5000 premium issued today')."
+                ),
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "client_name": {"type": "string"},
+                        "life_assured": {"type": "string", "description": "Defaults to client_name if not stated separately."},
+                        "policy_number": {"type": "string"},
+                        "product_category": {"type": "string", "description": "One of: RP, SP, A&H, GI, Careshield."},
+                        "product_name": {"type": "string"},
+                        "issued_date": {"type": "string", "description": "ISO date; default to today if unspecified. Must be a real date — this feeds the Dashboard's MTD/YTD numbers."},
+                        "payment_mode": {"type": "string", "description": "One of: Annual, Monthly, Semi-Annual, Quarterly, Single."},
+                        "premium": {"type": "number", "description": "Annualised premium."},
+                        "eape": {"type": "number", "description": "Annualised EAPE."},
+                        "fyc": {"type": "number", "description": "Annualised FYC."},
+                        "remark": {"type": "string"},
+                    },
+                    "required": ["client_name", "policy_number", "issued_date"],
+                },
+            }
+        )
     return tools
 
 
@@ -242,6 +317,20 @@ async def _dispatch_tool(name: str, tool_input: dict) -> tuple[str, bool]:
             except sheets_service.NoReceiptToUndo as exc:
                 return json.dumps({"status": "nothing_to_undo", "message": str(exc)}), False
             return json.dumps({"status": "removed", "removed": removed}), False
+
+        if name == "log_lead":
+            fields = dict(tool_input)
+            fields.setdefault("date", datetime.now(ZoneInfo(settings.timezone)).strftime("%Y-%m-%d"))
+            row = await sales_tracker_service.append_lead(fields)
+            return json.dumps({"status": "logged", "row": row}), False
+
+        if name == "log_case":
+            fields = dict(tool_input)
+            if not fields.get("life_assured"):
+                fields["life_assured"] = fields.get("client_name")
+            fields.setdefault("issued_date", datetime.now(ZoneInfo(settings.timezone)).strftime("%Y-%m-%d"))
+            row = await sales_tracker_service.append_case(fields)
+            return json.dumps({"status": "logged", "row": row}), False
 
         return json.dumps({"error": f"Unknown tool '{name}'"}), True
 

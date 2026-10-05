@@ -60,6 +60,21 @@ which matters because the bot runs unattended on a server.
 3. Copy the spreadsheet ID from its URL:
    `https://docs.google.com/spreadsheets/d/`**`THIS_PART`**`/edit` — this is `GOOGLE_SHEET_ID`.
 
+### Share the Sales Tracker workbook
+
+This is for logging new leads and closed cases straight from a Telegram chat message into
+your "Sales Tracker" .xlsx file — if it lives in a Drive folder shared with you by someone
+else (e.g. your manager), note it's a real uploaded Excel file, not a native Google Sheet,
+so this needs the **Drive API** too (enable it alongside Calendar/Sheets in step 4 above).
+
+1. In Google Drive, right-click the Sales Tracker file (or its parent folder) → **Share**,
+   paste the same service account `client_email`, set role to **Editor**, send.
+2. Copy the file ID from its URL:
+   `https://drive.google.com/file/d/`**`THIS_PART`**`/view` — this is `GOOGLE_SALES_TRACKER_FILE_ID`.
+3. The bot edits only the "Leads" and "Production" tabs (by name) in the pre-formatted
+   blank rows already in the sheet — it never touches the Dashboard, Growth chart, or any
+   other tab, so it's safe to use even while someone else is set up to review the same file.
+
 ## 5. Run it locally to test
 
 ```bash
@@ -107,6 +122,11 @@ Ctrl+C to stop.
   via the chat tool instead.
 - **Caption override**: PDFs default to policy summaries and photos default to receipts. Add
   the word "receipt" as a caption on a PDF, or "policy" as a caption on a photo, to flip that.
+- **Leads / closed cases**: just describe one in chat — "new lead John Tan 91234567 referral,
+  proposing Wealth Accelerate ~$5k premium" or "closed case Mary Lim policy POL123456 Wealth
+  Accelerate RP $5000 premium issued today". Only the name (lead) or client name/policy
+  number/issued date (case) are required — everything else is optional, filled in if you give
+  it. The bot confirms back exactly what it logged and which row.
 - **Scheduling**: talk to it naturally — "what's free tomorrow afternoon?", "cancel my 3pm
   with John", "book X for next Tuesday 10am". It resolves relative dates against the
   `TIMEZONE` you set.

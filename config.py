@@ -40,6 +40,7 @@ class Settings:
     google_service_account_info: Optional[dict]
     google_calendar_id: Optional[str]
     google_sheet_id: Optional[str]
+    google_sales_tracker_file_id: Optional[str]
     policy_pdf_storage_dir: Optional[str]
 
     onedrive_client_id: Optional[str]
@@ -60,6 +61,10 @@ class Settings:
     @property
     def sheets_configured(self) -> bool:
         return bool(self.google_service_account_info and self.google_sheet_id)
+
+    @property
+    def sales_tracker_configured(self) -> bool:
+        return bool(self.google_service_account_info and self.google_sales_tracker_file_id)
 
     @property
     def onedrive_configured(self) -> bool:
@@ -118,6 +123,7 @@ def load_settings() -> Settings:
 
     calendar_id = os.environ.get("GOOGLE_CALENDAR_ID", "").strip() or None
     sheet_id = os.environ.get("GOOGLE_SHEET_ID", "").strip() or None
+    sales_tracker_file_id = os.environ.get("GOOGLE_SALES_TRACKER_FILE_ID", "").strip() or None
     policy_pdf_storage_dir = os.environ.get("POLICY_PDF_STORAGE_DIR", "").strip() or None
     onedrive_client_id = os.environ.get("ONEDRIVE_CLIENT_ID", "").strip() or None
     onedrive_token_cache = os.environ.get("ONEDRIVE_TOKEN_CACHE", "").strip() or None
@@ -138,6 +144,7 @@ def load_settings() -> Settings:
         google_service_account_info=service_account_info,
         google_calendar_id=calendar_id,
         google_sheet_id=sheet_id,
+        google_sales_tracker_file_id=sales_tracker_file_id,
         policy_pdf_storage_dir=policy_pdf_storage_dir,
         onedrive_client_id=onedrive_client_id,
         onedrive_token_cache=onedrive_token_cache,
@@ -157,6 +164,12 @@ def load_settings() -> Settings:
             "Google Sheets is not fully configured (need GOOGLE_SERVICE_ACCOUNT_JSON/"
             "FILE and GOOGLE_SHEET_ID) — receipt logging will reply with an "
             "explanation instead of working."
+        )
+    if not settings.sales_tracker_configured:
+        logger.warning(
+            "The Sales Tracker is not fully configured (need GOOGLE_SERVICE_ACCOUNT_JSON/"
+            "FILE and GOOGLE_SALES_TRACKER_FILE_ID) — logging leads/cases will reply "
+            "with an explanation instead of working."
         )
     if not settings.policy_pdf_storage_dir:
         logger.warning(
