@@ -14,7 +14,7 @@ import io
 import logging
 import re
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 from typing import Optional
 
 import openpyxl
@@ -206,6 +206,100 @@ def _onedrive_remote_path(client_name: str, filename: str) -> str:
 def _filename(client_name: str) -> str:
     safe = _onedrive_safe_name(client_name)
     return f"ILP Funds Update {safe}.xlsx"
+
+
+def _parse_dollar_amount(value) -> Optional[float]:
+    """Parses "$12,345" (or a raw number already) back into a float. Used by
+    _parse_existing() to read totals written as plain display strings by
+    build_fund_update_workbook()."""
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    digits = re.sub(r"[^0-9.]", "", str(value))
+    if not digits:
+        return None
+    try:
+        return float(digits)
+    except ValueError:
+        return None
+
+
+def _parse_existing(xlsx_bytes: bytes) -> dict:
+    """Reads back the fields build_fund_update_workbook() wrote into a
+    previous report, so a repeat /fundupdate for the same client can reuse
+    them instead of re-asking from scratch. Live fund prices, the
+    1st-anniversary date and "current" date are never reused here — those
+    get recomputed/refetched fresh on every update; only the data this
+    function can't recompute (product, policy number, commencement date,
+    total invested, ref illustration, fund list + allocations) is read
+    back."""
+    wb = openpyxl.load_workbook(io.BytesIO(xlsx_bytes), data_only=False)
+    ws = wb[SHEET_NAME] if SHEET_NAME in wb.sheetnames else wb.active
+
+    product = ws["B1"].value
+    policy_number = ws["B2"].value
+
+    commencement_date = ws["B3"].value
+    if isinstance(commencement_date, datetime):
+        commencement_date = commencement_date.date()
+    elif not isinstance(commencement_date, date):
+        commencement_date = None
+
+    total_invested = _parse_dollar_amount(ws["E1"].value)
+
+    ref_illustration = ws["E3"].value
+    if isinstance(ref_illustration, str) and not ref_illustration.strip():
+        ref_illustration = None
+
+    funds: list[dict] = []
+    r = 6
+    while True:
+        name = ws[f"B{r}"].value
+        if not name:
+            break
+        allocation_raw = ws[f"A{r}"].value
+        allocation_pct = float(allocation_raw) * 100 if isinstance(allocation_raw, (int, float)) else None
+        funds.append({"name": str(name).strip(), "allocation_pct": allocation_pct})
+        r += 1
+
+    return {
+        "product": product,
+        "policy_number": policy_number,
+        "commencement_date": commencement_date,
+        "total_invested": total_invested,
+        "ref_illustration": ref_illustration,
+        "funds": funds,
+    }
+
+
+async def load_existing(client_name: str) -> Optional[dict]:
+    """Looks up this client's most recent "ILP Funds Update" report on
+    OneDrive (same path save_to_onedrive() writes to) and returns its
+    reusable fields, or None if there's no prior report for this client, or
+    it couldn't be read/parsed. Used by the /fundupdate wizard to offer
+    pre-filling a repeat update instead of starting from scratch, the same
+    way policy_workbook.py lets the Policy Summary wizard build on an
+    existing client folder."""
+    filename = _filename(client_name)
+    remote_path = _onedrive_remote_path(client_name, filename)
+    try:
+        xlsx_bytes = await onedrive_service.download_bytes(remote_path)
+    except Exception:
+        logger.exception(
+            "Failed to check OneDrive for an existing fund update report (client=%s)",
+            client_name,
+        )
+        return None
+    if xlsx_bytes is None:
+        return None
+    try:
+        return _parse_existing(xlsx_bytes)
+    except Exception:
+        logger.exception(
+            "Failed to parse existing fund update report (client=%s)", client_name
+        )
+        return None
 
 
 async def save_to_onedrive(client_name: str, xlsx_bytes: bytes) -> str:
