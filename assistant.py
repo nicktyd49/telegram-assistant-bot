@@ -11,7 +11,13 @@ import logging
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from anthropic import AsyncAnthropic
+from anthropic import (
+    AsyncAnthropic,
+    AnthropicError,
+    APIConnectionError,
+    OverloadedError,
+    RateLimitError,
+)
 
 from config import settings
 from services import calendar_service, sheets_service, sales_tracker_service
@@ -354,7 +360,20 @@ async def run_conversation(history: list[dict]) -> str:
         if tools:
             create_kwargs["tools"] = tools
 
-        response = await anthropic_client.messages.create(**create_kwargs)
+        try:
+            response = await anthropic_client.messages.create(**create_kwargs)
+        except (RateLimitError, OverloadedError):
+            # Transient and common - surface something actionable instead of
+            # falling through to bot.py's generic catch-all, which looked like
+            # a calendar/tool bug the first time this happened but wasn't one.
+            logger.warning("Anthropic API rate-limited/overloaded")
+            return "Claude's API is rate-limited or overloaded right now - try again in a few seconds."
+        except APIConnectionError:
+            logger.exception("Anthropic API connection error")
+            return "Having trouble reaching Claude's API right now (network issue on their end) - try again in a moment."
+        except AnthropicError:
+            logger.exception("Anthropic API call failed")
+            return "Claude's API returned an error - try again, and check the Railway logs if it keeps happening."
 
         history.append({"role": "assistant", "content": response.content})
 
