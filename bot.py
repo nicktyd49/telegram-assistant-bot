@@ -1635,6 +1635,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             if text.lower() in {"done", "finish"}:
                 await _finish_fund_list(update.message, chat_id)
                 return
+            if text.lower() in {"undo", "undo last", "remove last"}:
+                if state["funds"]:
+                    removed = state["funds"].pop()
+                    await update.message.reply_text(
+                        f"Removed {removed['name']} ({removed['allocation_pct']:.0f}%). "
+                        "Send the next fund's name, or type done if that's all."
+                    )
+                else:
+                    await update.message.reply_text("No funds added yet — nothing to undo.")
+                return
             if not text:
                 await update.message.reply_text("Send a fund name, or type done if you're finished.")
                 return
@@ -1643,9 +1653,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 state["pending_fund"] = {
                     "name": resolved.display_name, "code": resolved.code, "currency": resolved.currency,
                 }
-                state["step"] = "fund_allocation"
+                state["step"] = "confirm_fund_match"
                 await update.message.reply_text(
-                    f"Found it — {resolved.display_name} ({resolved.currency}). What's its allocation %? (e.g. 25)"
+                    f"Found it — {resolved.display_name} ({resolved.currency}). Is that the right fund? (yes/no)"
                 )
             else:
                 state["pending_fund_name"] = text
@@ -1655,6 +1665,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     "currency from the fund's page on fundprices.insurance.hsbc.com.sg, like "
                     "`F0GBR04K8L USD`, or type skip to leave this fund out."
                 )
+            return
+
+        if step == "confirm_fund_match":
+            answer = text.lower()
+            if answer in {"yes", "y", "yeah", "yep", "correct", "right"}:
+                state["step"] = "fund_allocation"
+                await update.message.reply_text("Great — what's its allocation %? (e.g. 25)")
+                return
+            if answer in {"no", "n", "nope", "wrong"}:
+                state.pop("pending_fund", None)
+                state["step"] = "fund_name"
+                await update.message.reply_text(
+                    "Okay, scratch that match. Send the fund name again — try matching the exact name "
+                    "from fundprices.insurance.hsbc.com.sg (e.g. include the fund house or currency) so I "
+                    "pick the right one, or type done if that's all."
+                )
+                return
+            await update.message.reply_text("Reply yes or no — is that the right fund?")
             return
 
         if step == "awaiting_fund_code":
