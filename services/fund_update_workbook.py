@@ -184,7 +184,16 @@ def build_fund_update_workbook(data: FundUpdateData) -> bytes:
     ws.row_dimensions[prompt_rows_start - 1].height = 15
 
     # --- Column widths / page setup --------------------------------------
-    widths = {"A": 14.83, "B": 46.0, "C": 11.5, "D": 11.5, "E": 11.5, "F": 8.5, "G": 12.16}
+    # A1 (client name, 16pt bold) and D1/D2/D3 (bold field labels) sit next
+    # to non-empty cells (B1, E1/E2/E3), so Excel/Calc clips any overflow at
+    # the column border instead of letting it spill over -- it doesn't wrap,
+    # it just cuts the text off mid-word. A fixed column width that happened
+    # to fit a short name/label would silently clip a longer one, so A is
+    # sized to the actual client name and D is sized to fit the longest of
+    # the three fixed labels ("REF POLICY ILLUSTRATION:").
+    name_width = max(14.83, len(data.client_name) * 1.55 + 3)
+    label_width = max(11.5, len("REF POLICY ILLUSTRATION:") * 1.05 + 3)
+    widths = {"A": name_width, "B": 46.0, "C": 11.5, "D": label_width, "E": 11.5, "F": 8.5, "G": 12.16}
     for col, width in widths.items():
         ws.column_dimensions[col].width = width
 
