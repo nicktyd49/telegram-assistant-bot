@@ -1,8 +1,8 @@
-"""Builds "ILP Funds Update" workbooks — the report format worked out by
-hand with Nic for client Lau Jing Wen (commencement / 1st-anniversary /
-current fund prices, allocation, gain/loss, remarks), now parameterized so
-the Telegram bot can generate one for any client from a short chat wizard
-instead of a one-off manual build.
+"""Builds "ILP Funds Update" workbooks, matching the house template Nic
+keeps at OneDrive Client/ILP Funds Update Template.xlsx (commencement vs
+current fund price, allocation, gain/loss since inception, remarks) —
+parameterized so the Telegram bot can generate one for any client from a
+short chat wizard instead of a one-off manual build.
 
 Mirrors services/policy_workbook.py's conventions (OneDrive folder layout,
 filename sanitizing) but is otherwise a self-contained builder — this report
@@ -18,8 +18,7 @@ from datetime import date, datetime
 from typing import Optional
 
 import openpyxl
-from openpyxl.styles import Alignment, Font
-from openpyxl.utils import get_column_letter
+from openpyxl.styles import Alignment, Border, Font, Side
 from openpyxl.worksheet.worksheet import Worksheet
 
 from services import onedrive_service
@@ -29,9 +28,19 @@ logger = logging.getLogger("assistant-bot.fund_update_workbook")
 SHEET_NAME = "ILP Funds Update"
 ONEDRIVE_WORKBOOK_FOLDER = "Client"
 
-GREY = "FF999999"
-GREEN = "FF00B050"
-RED = "FFFF0000"
+# House style, copied from the template: Calibri 11 throughout, a muted
+# navy for all text, thin gray rules/borders, green/red only for the +/-
+# column, and a lighter gray for the free-text remark column.
+NAVY = "FF44546A"
+BORDER_GRAY = "FFA6A6A6"
+GREEN = "FF70AD47"
+RED = "FFC00000"
+REMARK_GRAY = "FFBFBFBF"
+
+# Page header/footer text, copied verbatim (including its own spacing
+# quirks) from the template — Nic confirmed this should be reused as-is.
+_HEADER_TEXT = "P R O P E R T Y O F  C A S S  N A O M I  P O H  O R G A N I S A T I ON"
+_FOOTER_TEXT = "&K03+000P R I V A T E  A N D  C O N F I D E N T I A L"
 
 _ONEDRIVE_ILLEGAL_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
@@ -46,7 +55,6 @@ class FundRow:
     name: str
     allocation_pct: float  # e.g. 25 for 25%
     price_commencement: float
-    price_anniversary: float
     price_current: float
     remark: Optional[str] = None
 
@@ -57,7 +65,6 @@ class FundUpdateData:
     product: str
     policy_number: str
     commencement_date: date
-    anniversary_date: date
     current_date: date
     total_invested: float
     account_value: float
@@ -67,9 +74,28 @@ class FundUpdateData:
     action_date_label: Optional[date] = None  # defaults to current_date
 
 
-def _set_row_heights(ws: Worksheet, heights: dict[int, float]) -> None:
-    for row, height in heights.items():
-        ws.row_dimensions[row].height = height
+def _thin(color: str) -> Side:
+    return Side(style="thin", color=color)
+
+
+def _box(ws: Worksheet, cell_range: str, color: str = BORDER_GRAY, full_grid: bool = False) -> None:
+    """Draws a border around cell_range. full_grid=True boxes every cell
+    (a real grid, used for the fund table); otherwise only the outer
+    perimeter gets a border (used for the ACTION box)."""
+    rows = list(ws[cell_range])
+    n_rows = len(rows)
+    for r_idx, row in enumerate(rows):
+        n_cols = len(row)
+        for c_idx, cell in enumerate(row):
+            if full_grid:
+                cell.border = Border(left=_thin(color), right=_thin(color), top=_thin(color), bottom=_thin(color))
+                continue
+            left = _thin(color) if c_idx == 0 else None
+            right = _thin(color) if c_idx == n_cols - 1 else None
+            top = _thin(color) if r_idx == 0 else None
+            bottom = _thin(color) if r_idx == n_rows - 1 else None
+            if left or right or top or bottom:
+                cell.border = Border(left=left, right=right, top=top, bottom=bottom)
 
 
 def build_fund_update_workbook(data: FundUpdateData) -> bytes:
@@ -89,87 +115,143 @@ def build_fund_update_workbook(data: FundUpdateData) -> bytes:
     action_date_row = action_row + 1
     prompt_rows_start = action_date_row + 2
 
-    # --- Header block -----------------------------------------------------
-    ws["A1"] = data.client_name.upper()
-    ws["A1"].font = Font(size=16, bold=True)
+    # Every styled cell gets an explicit Calibri/11 — leaving name/size
+    # unset makes some renderers fall back to a wider substitute font,
+    # which is wide enough to clip "COMMENCEMENT" and "POLICY NUMBER"
+    # against the column next to them even though they fit comfortably
+    # in real Calibri (this bit Nic's Taufiq report before the font was
+    # pinned down explicitly).
+    def navy_font(color: str = NAVY, **kw) -> Font:
+        return Font(name="Calibri", size=11, color=color, **kw)
+
+    # --- Header block -------------------------------------------------
+    # No client name in the body by design (Nic confirmed) — just the
+    # product under a generic "POLICY" label, same as POLICY NUMBER and
+    # COMMENCEMENT below it. The three right-side labels are right-aligned
+    # so a long one (REF POLICY ILLUSTRATION:) overflows left into the
+    # empty C column instead of getting clipped against its value cell.
+    ws["A1"] = "POLICY"
+    ws["A1"].font = navy_font()
     ws["B1"] = data.product
-    ws["B1"].font = Font(size=12, italic=True)
+    ws["B1"].font = navy_font()
     ws["D1"] = "TOTAL INVESTMENT:"
-    ws["D1"].font = Font(bold=True)
+    ws["D1"].font = navy_font()
+    ws["D1"].alignment = Alignment(horizontal="right")
     ws.merge_cells("E1:F1")
-    ws["E1"] = f"${data.total_invested:,.0f}"
-    ws["E1"].font = Font(bold=True)
+    ws["E1"] = data.total_invested
+    ws["E1"].number_format = '"$"#,##0'
+    ws["E1"].font = navy_font()
+    ws["E1"].alignment = Alignment(horizontal="center")
+    ws["E1"].border = Border(bottom=_thin(BORDER_GRAY))
 
     ws["A2"] = "POLICY NUMBER"
+    ws["A2"].font = navy_font()
     ws["B2"] = data.policy_number
+    ws["B2"].font = navy_font()
     ws["D2"] = "ACCOUNT VALUE:"
-    ws["D2"].font = Font(bold=True)
+    ws["D2"].font = navy_font()
+    ws["D2"].alignment = Alignment(horizontal="right")
     ws.merge_cells("E2:F2")
     ws["E2"] = f"${data.account_value:,.0f} ({data.account_value_asof:%d/%m/%Y})"
-    ws["E2"].font = Font(bold=True)
+    ws["E2"].font = navy_font()
+    ws["E2"].alignment = Alignment(horizontal="center")
+    ws["E2"].border = Border(bottom=_thin(BORDER_GRAY))
 
     ws["A3"] = "COMMENCEMENT"
+    ws["A3"].font = navy_font()
     ws["B3"] = data.commencement_date
-    ws["B3"].number_format = "dd/mm/yyyy"
+    ws["B3"].number_format = "d mmmm yyyy"
+    ws["B3"].font = navy_font()
     ws["D3"] = "REF POLICY ILLUSTRATION:"
-    ws["D3"].font = Font(bold=True)
+    ws["D3"].font = navy_font()
+    ws["D3"].alignment = Alignment(horizontal="right")
     ws.merge_cells("E3:F3")
-    if data.ref_illustration:
-        ws["E3"] = data.ref_illustration
-        ws["E3"].font = Font(color=GREY)
+    ws["E3"] = data.ref_illustration or "-"
+    ws["E3"].font = navy_font()
+    ws["E3"].alignment = Alignment(horizontal="center")
+    ws["E3"].border = Border(bottom=_thin(BORDER_GRAY))
 
     for row in (1, 2, 3):
         ws.row_dimensions[row].height = 25
     ws.row_dimensions[4].height = 15
 
     # --- Table header -------------------------------------------------
-    headers = ["Allocation", "Fund", data.commencement_date, data.anniversary_date, data.current_date, "+/-", "Remark"]
-    for col, value in zip("ABCDEFG", headers):
+    # C = current price, D = commencement price (template puts the newer
+    # date on the left, inception date on the right — not chronological,
+    # but that's what Nic's template does).
+    headers = ["Allocation", "Fund", data.current_date, data.commencement_date, "+/-", "Remark"]
+    for col, value in zip("ABCDEF", headers):
         cell = ws[f"{col}5"]
         cell.value = value
-        cell.font = Font(bold=True)
+        cell.font = navy_font()
         cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-    for col in ("C", "D", "E"):
-        ws[f"{col}5"].number_format = "dd/mm/yyyy"
+    for col in ("C", "D"):
+        ws[f"{col}5"].number_format = "d-mmm-yy"
     ws.row_dimensions[5].height = 25
 
-    # --- Fund rows ----------------------------------------------------
+    # --- Fund rows ------------------------------------------------------
+    # The Fund column is narrower in this layout (30 vs. the old 46), so a
+    # long fund name can need more than one wrapped line — bump that row's
+    # height instead of leaving wrap_text to silently clip it against a
+    # fixed 25pt row (same clipping failure mode as the header block,
+    # just in the table this time).
+    chars_per_line = 24
     for i, fund in enumerate(data.funds):
         r = first_fund_row + i
         ws[f"A{r}"] = fund.allocation_pct / 100
         ws[f"A{r}"].number_format = "0%"
+        ws[f"A{r}"].font = navy_font()
         ws[f"A{r}"].alignment = Alignment(horizontal="center")
+
         ws[f"B{r}"] = fund.name
-        ws[f"C{r}"] = fund.price_commencement
-        ws[f"D{r}"] = fund.price_anniversary
-        ws[f"E{r}"] = fund.price_current
-        for col in ("C", "D", "E"):
-            ws[f"{col}{r}"].number_format = "0.0000"
+        ws[f"B{r}"].font = navy_font()
+        ws[f"B{r}"].alignment = Alignment(vertical="center", wrap_text=True)
+
+        ws[f"C{r}"] = fund.price_current
+        ws[f"D{r}"] = fund.price_commencement
+        for col in ("C", "D"):
+            ws[f"{col}{r}"].number_format = '"$"#,##0.000'
+            ws[f"{col}{r}"].font = navy_font()
             ws[f"{col}{r}"].alignment = Alignment(horizontal="center")
 
-        change = (fund.price_current - fund.price_anniversary) / fund.price_anniversary if fund.price_anniversary else 0.0
-        cell = ws[f"F{r}"]
-        cell.value = change
+        # Gain/loss since the policy's commencement (not year-over-year —
+        # the template only tracks two price points per fund, not three).
+        change = (
+            (fund.price_current - fund.price_commencement) / fund.price_commencement
+            if fund.price_commencement
+            else 0.0
+        )
+        cell = ws[f"E{r}"]
+        cell.value = f"=(C{r}-D{r})/D{r}"
         cell.number_format = "0%"
-        cell.font = Font(bold=True, color=GREEN if change >= 0 else RED)
+        cell.font = navy_font(color=GREEN if change >= 0 else RED)
         cell.alignment = Alignment(horizontal="center")
 
-        if fund.remark:
-            ws[f"G{r}"] = fund.remark
-            ws[f"G{r}"].font = Font(color=GREY)
-        ws.row_dimensions[r].height = 25
+        if fund.remark is not None:
+            ws[f"F{r}"] = fund.remark
+        ws[f"F{r}"].font = navy_font(color=REMARK_GRAY)
+        ws[f"F{r}"].alignment = Alignment(horizontal="center")
+
+        needed_lines = -(-len(fund.name) // chars_per_line)  # ceil div
+        ws.row_dimensions[r].height = max(25.0, needed_lines * 14.0 + 6.0)
+
+    _box(ws, f"A5:F{last_fund_row}", full_grid=True)
 
     # --- Action section -------------------------------------------------
-    ws.merge_cells(f"A{action_row}:G{action_row}")
     ws[f"A{action_row}"] = "ACTION:"
-    ws[f"A{action_row}"].font = Font(bold=True)
+    ws[f"A{action_row}"].font = navy_font()
     ws.row_dimensions[action_row].height = 15
 
-    ws.merge_cells(f"A{action_date_row}:G{action_date_row}")
+    ws.merge_cells(f"A{action_date_row}:F{action_date_row}")
     action_date = data.action_date_label or data.current_date
     ws[f"A{action_date_row}"] = f"{action_date:%d/%m/%Y} - "
+    ws[f"A{action_date_row}"].font = navy_font()
+    ws[f"A{action_date_row}"].alignment = Alignment(horizontal="left", vertical="top", wrap_text=True)
     ws.row_dimensions[action_date_row].height = 60
 
+    _box(ws, f"A{action_row}:F{action_date_row}", full_grid=False)
+
+    # --- Prompt sections (no border, per the template) -------------------
     prompts = [
         "Initial Objective of this investment\n",
         "Market Update in the last 12 months\n",
@@ -177,23 +259,15 @@ def build_fund_update_workbook(data: FundUpdateData) -> bytes:
     ]
     for i, prompt in enumerate(prompts):
         r = prompt_rows_start + i
-        ws.merge_cells(f"A{r}:G{r}")
+        ws.merge_cells(f"A{r}:F{r}")
         ws[f"A{r}"] = prompt
-        ws[f"A{r}"].alignment = Alignment(vertical="top", wrap_text=True)
+        ws[f"A{r}"].font = navy_font()
+        ws[f"A{r}"].alignment = Alignment(vertical="top", horizontal="left", wrap_text=True)
         ws.row_dimensions[r].height = 70
     ws.row_dimensions[prompt_rows_start - 1].height = 15
 
     # --- Column widths / page setup --------------------------------------
-    # A1 (client name, 16pt bold) and D1/D2/D3 (bold field labels) sit next
-    # to non-empty cells (B1, E1/E2/E3), so Excel/Calc clips any overflow at
-    # the column border instead of letting it spill over -- it doesn't wrap,
-    # it just cuts the text off mid-word. A fixed column width that happened
-    # to fit a short name/label would silently clip a longer one, so A is
-    # sized to the actual client name and D is sized to fit the longest of
-    # the three fixed labels ("REF POLICY ILLUSTRATION:").
-    name_width = max(14.83, len(data.client_name) * 1.55 + 3)
-    label_width = max(11.5, len("REF POLICY ILLUSTRATION:") * 1.05 + 3)
-    widths = {"A": name_width, "B": 46.0, "C": 11.5, "D": label_width, "E": 11.5, "F": 8.5, "G": 12.16}
+    widths = {"A": 14.83, "B": 30.0, "C": 10.83, "D": 12.16, "E": 10.83, "F": 12.16}
     for col, width in widths.items():
         ws.column_dimensions[col].width = width
 
@@ -201,6 +275,9 @@ def build_fund_update_workbook(data: FundUpdateData) -> bytes:
     ws.page_setup.fitToWidth = 1
     ws.page_setup.fitToHeight = 1
     ws.sheet_properties.pageSetUpPr.fitToPage = True
+
+    ws.oddHeader.center.text = _HEADER_TEXT
+    ws.oddFooter.center.text = _FOOTER_TEXT
 
     buf = io.BytesIO()
     wb.save(buf)
@@ -237,12 +314,11 @@ def _parse_dollar_amount(value) -> Optional[float]:
 def _parse_existing(xlsx_bytes: bytes) -> dict:
     """Reads back the fields build_fund_update_workbook() wrote into a
     previous report, so a repeat /fundupdate for the same client can reuse
-    them instead of re-asking from scratch. Live fund prices, the
-    1st-anniversary date and "current" date are never reused here — those
-    get recomputed/refetched fresh on every update; only the data this
-    function can't recompute (product, policy number, commencement date,
-    total invested, ref illustration, fund list + allocations) is read
-    back."""
+    them instead of re-asking from scratch. Live fund prices and the
+    "current" date are never reused here — those get recomputed/refetched
+    fresh on every update; only the data this function can't recompute
+    (product, policy number, commencement date, total invested, ref
+    illustration, fund list + allocations) is read back."""
     wb = openpyxl.load_workbook(io.BytesIO(xlsx_bytes), data_only=False)
     ws = wb[SHEET_NAME] if SHEET_NAME in wb.sheetnames else wb.active
 
@@ -258,7 +334,7 @@ def _parse_existing(xlsx_bytes: bytes) -> dict:
     total_invested = _parse_dollar_amount(ws["E1"].value)
 
     ref_illustration = ws["E3"].value
-    if isinstance(ref_illustration, str) and not ref_illustration.strip():
+    if isinstance(ref_illustration, str) and (not ref_illustration.strip() or ref_illustration.strip() == "-"):
         ref_illustration = None
 
     funds: list[dict] = []

@@ -1138,8 +1138,8 @@ async def _advance_reuse_queue(message, chat_id: int) -> None:
 async def _menu_fund_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Starts an 'ILP Funds Update' session - walks through the policy
     details and fund allocations in chat, fetches live NAV from HSBC for
-    commencement / 1st-anniversary / today, builds the report and saves it
-    straight to OneDrive under Client/<name>/, same as Policy Summary does."""
+    commencement / today, builds the report and saves it straight to
+    OneDrive under Client/<name>/, same as Policy Summary does."""
     chat_id = update.effective_chat.id
     pending_policy.pop(chat_id, None)
     pending_policy_session.pop(chat_id, None)
@@ -1190,17 +1190,13 @@ async def _build_fund_update(message, chat_id: int) -> None:
     await message.reply_text(f"Fetching live prices for {len(funds_in)} fund(s) from HSBC — one moment...")
 
     commencement = data["commencement_date"]
-    try:
-        anniversary = date(commencement.year + 1, commencement.month, commencement.day)
-    except ValueError:
-        anniversary = commencement + timedelta(days=365)
     current = date.today()
 
     fund_rows = []
     errors = []
     for i, f in enumerate(funds_in):
         try:
-            prices = fund_price_service.fetch_prices(f["code"], f["currency"], [commencement, anniversary, current])
+            prices = fund_price_service.fetch_prices(f["code"], f["currency"], [commencement, current])
         except fund_price_service.FundPriceError as exc:
             errors.append(f"{f['name']}: {exc}")
             continue
@@ -1209,7 +1205,6 @@ async def _build_fund_update(message, chat_id: int) -> None:
             name=display_name,
             allocation_pct=f["allocation_pct"],
             price_commencement=prices[commencement].value,
-            price_anniversary=prices[anniversary].value,
             price_current=prices[current].value,
             remark=remarks[i] if i < len(remarks) else None,
         ))
@@ -1225,7 +1220,6 @@ async def _build_fund_update(message, chat_id: int) -> None:
         product=data["product"],
         policy_number=data["policy_number"],
         commencement_date=commencement,
-        anniversary_date=anniversary,
         current_date=current,
         total_invested=data["total_invested"],
         account_value=data["account_value"],
