@@ -10,6 +10,7 @@ import traceback
 from datetime import datetime, timedelta, date, time as dt_time, timezone
 from io import BytesIO
 from pathlib import Path
+from typing import Optional
 from zoneinfo import ZoneInfo
 
 import telegram.error
@@ -26,7 +27,7 @@ from telegram.ext import (
 
 from config import settings
 from assistant import anthropic_client, run_conversation
-from services import calendar_service, sheets_service, pdf_utils, policy_workbook, policy_illustration, onedrive_service, action_plan, client_pairing, news_service, poster_service, ig_post_service, fund_price_service, fund_update_workbook
+from services import calendar_service, sheets_service, pdf_utils, policy_workbook, policy_illustration, onedrive_service, action_plan, client_pairing, news_service, poster_service, ig_post_service, fund_price_service, fund_update_workbook, fund_commentary_service
 from prompts import RECEIPT_EXTRACTION_PROMPT, POLICY_FIELDS_EXTRACTION_PROMPT
 
 MAX_HISTORY_MESSAGES = 40
@@ -1178,13 +1179,16 @@ async def fund_done_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await _finish_fund_list(query.message, update.effective_chat.id)
 
 
-async def _build_fund_update(message, chat_id: int) -> None:
-    """Fetches live prices for every fund in the session, builds the
-    workbook, saves it to OneDrive, and sends it back on Telegram. Pops the
-    session either way so a failure doesn't leave the chat stuck."""
-    state = pending_fund_update_session.pop(chat_id, None)
-    if not state:
-        return
+async def _fetch_fund_rows_and_draft(message, chat_id: int, state: dict) -> None:
+    """Fetches live fund prices right after Remarks (so real performance
+    numbers exist before any drafting happens, and _build_fund_update
+    doesn't have to fetch them again), then asks fund_commentary_service to
+    draft Action Notes / Market Update / Outlook from those numbers. On
+    success, stores the fetched rows + draft on the session and moves into
+    the review-each-section flow (accept / skip / override). On any
+    drafting failure (no API key, bad response, etc.) it falls back to the
+    pre-existing manual entry steps so a Claude hiccup never blocks the
+    report."""
     data = state["data"]
     funds_in = state["funds"]
     remarks = state.get("remarks") or []
@@ -1219,6 +1223,109 @@ async def _build_fund_update(message, chat_id: int) -> None:
 
     if errors:
         await message.reply_text("Some funds couldn't be priced:\n" + "\n".join(errors))
+    if not fund_rows:
+        await message.reply_text("Couldn't build the report — no fund prices came back.", reply_markup=main_menu_keyboard())
+        pending_fund_update_session.pop(chat_id, None)
+        return
+
+    state["_fund_rows"] = fund_rows
+    state["_commencement"] = commencement
+    state["_anniversary"] = anniversary
+    state["_current"] = current
+
+    try:
+        draft = await fund_commentary_service.draft_commentary(
+            product=data["product"],
+            total_invested=data["total_invested"],
+            account_value=data["account_value"],
+            account_value_asof=data["account_value_asof"],
+            funds=[
+                {
+                    "name": fr.name,
+                    "allocation_pct": fr.allocation_pct,
+                    "change_pct": (
+                        (fr.price_current - fr.price_commencement) / fr.price_commencement
+                        if fr.price_commencement else None
+                    ),
+                }
+                for fr in fund_rows
+            ],
+        )
+    except fund_commentary_service.CommentaryDraftError:
+        logger.exception("Commentary draft failed — falling back to manual entry")
+        state["step"] = "action_notes"
+        pending_fund_update_session[chat_id] = state
+        await message.reply_text(
+            "Couldn't auto-draft the commentary this time, so let's fill it in by hand.\n\n"
+            "Any notes for the ACTION line (after today's date)? Or type skip."
+        )
+        return
+
+    state["_draft"] = draft
+    state["step"] = "review_action_notes"
+    pending_fund_update_session[chat_id] = state
+    await message.reply_text(
+        "Here's a draft Action Note:\n\n" + draft["action_notes"] +
+        "\n\nReply ok to accept, skip to leave it blank, or type your own replacement."
+    )
+
+
+async def _build_fund_update(message, chat_id: int, state: Optional[dict] = None) -> None:
+    """Builds the workbook, saves it to OneDrive, and sends it back on
+    Telegram. Pops the session either way so a failure doesn't leave the
+    chat stuck.
+
+    `state` normally arrives already carrying the fund rows and dates that
+    _fetch_fund_rows_and_draft fetched right after Remarks (so prices are
+    never fetched twice). If it's missing them for any reason — e.g. a
+    future caller that skips straight to this step — this falls back to
+    fetching them here itself, same as the original one-shot flow."""
+    if state is None:
+        state = pending_fund_update_session.get(chat_id)
+    pending_fund_update_session.pop(chat_id, None)
+    if not state:
+        return
+    data = state["data"]
+    funds_in = state["funds"]
+    remarks = state.get("remarks") or []
+
+    fund_rows = state.get("_fund_rows")
+    commencement = state.get("_commencement")
+    anniversary = state.get("_anniversary")
+    current = state.get("_current")
+
+    if fund_rows is None or commencement is None:
+        await message.chat.send_action("typing")
+        await message.reply_text(f"Fetching live prices for {len(funds_in)} fund(s) from HSBC — one moment...")
+
+        commencement = data["commencement_date"]
+        try:
+            anniversary = date(commencement.year + 1, commencement.month, commencement.day)
+        except ValueError:
+            anniversary = commencement + timedelta(days=365)
+        current = date.today()
+
+        fund_rows = []
+        errors = []
+        for i, f in enumerate(funds_in):
+            try:
+                prices = fund_price_service.fetch_prices(f["code"], f["currency"], [commencement, anniversary, current])
+            except fund_price_service.FundPriceError as exc:
+                errors.append(f"{f['name']}: {exc}")
+                continue
+            display_name = f["name"] if "(" in f["name"] else f"{f['name']} ({f['currency']})"
+            fund_rows.append(fund_update_workbook.FundRow(
+                name=display_name,
+                allocation_pct=f["allocation_pct"],
+                price_commencement=prices[commencement].value,
+                price_anniversary=prices[anniversary].value,
+                price_current=prices[current].value,
+                remark=remarks[i] if i < len(remarks) else None,
+            ))
+
+        if errors:
+            await message.reply_text("Some funds couldn't be priced:\n" + "\n".join(errors))
+
     if not fund_rows:
         await message.reply_text("Couldn't build the report — no fund prices came back.", reply_markup=main_menu_keyboard())
         return
@@ -1762,20 +1869,58 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             if text.lower() != "skip":
                 remark_list = [r.strip() for r in re.split(r"[,\n]", text) if r.strip()]
                 state["remarks"] = remark_list
-            state["step"] = "action_notes"
+            await _fetch_fund_rows_and_draft(update.message, chat_id, state)
+            return
+
+        # Draft shown, Nic accepts/skips/overrides each section in turn —
+        # "Show me first, I can edit or accept" per his own choice. Only
+        # reached when fund_commentary_service.draft_commentary() succeeded;
+        # see _fetch_fund_rows_and_draft for the manual fallback otherwise.
+        if step == "review_action_notes":
+            reply = text.lower()
+            if reply in {"ok", "okay", "accept", "yes", "y"}:
+                state["data"]["action_notes"] = state["_draft"]["action_notes"]
+            elif reply != "skip":
+                state["data"]["action_notes"] = text
+            state["step"] = "review_market_update"
             await update.message.reply_text(
-                "Any notes for the ACTION line (after today's date)? Or type skip."
+                "Here's a draft Market Update:\n\n" + state["_draft"]["market_update"] +
+                "\n\nReply ok to accept, skip to leave it blank, or type your own replacement."
             )
             return
 
+        if step == "review_market_update":
+            reply = text.lower()
+            if reply in {"ok", "okay", "accept", "yes", "y"}:
+                state["data"]["market_update"] = state["_draft"]["market_update"]
+            elif reply != "skip":
+                state["data"]["market_update"] = text
+            state["step"] = "review_outlook"
+            await update.message.reply_text(
+                "Here's a draft Outlook:\n\n" + state["_draft"]["outlook"] +
+                "\n\nReply ok to accept, skip to leave it blank, or type your own replacement."
+            )
+            return
+
+        if step == "review_outlook":
+            reply = text.lower()
+            if reply in {"ok", "okay", "accept", "yes", "y"}:
+                state["data"]["outlook"] = state["_draft"]["outlook"]
+            elif reply != "skip":
+                state["data"]["outlook"] = text
+            await _build_fund_update(update.message, chat_id, state)
+            return
+
+        # Manual fallback path — only reached if the AI draft call itself
+        # failed (see _fetch_fund_rows_and_draft's except branch). Initial
+        # Objective isn't asked here on purpose — it's set once at the
+        # policy's inception and almost never changes between reviews, so
+        # re-asking it on every update was pure friction. Nic can still
+        # fill it in by hand in Excel, or FundUpdateData still accepts it
+        # if a future caller wants to pass it through.
         if step == "action_notes":
             if text.lower() != "skip":
                 state["data"]["action_notes"] = text
-            # Initial Objective isn't asked here on purpose — it's set once
-            # at the policy's inception and almost never changes between
-            # reviews, so re-asking it on every update was pure friction.
-            # Nic can still fill it in by hand in Excel, or FundUpdateData
-            # still accepts it if a future caller wants to pass it through.
             state["step"] = "market_update"
             await update.message.reply_text(
                 "Market update for the last 12 months? Or type skip."
@@ -1794,7 +1939,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if step == "outlook":
             if text.lower() != "skip":
                 state["data"]["outlook"] = text
-            await _build_fund_update(update.message, chat_id)
+            await _build_fund_update(update.message, chat_id, state)
             return
 
         return
