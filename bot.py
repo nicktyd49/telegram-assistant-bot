@@ -1138,7 +1138,10 @@ async def _advance_reuse_queue(message, chat_id: int) -> None:
 async def _menu_fund_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Starts an 'ILP Funds Update' session - walks through the policy
     details and fund allocations in chat, fetches live NAV from HSBC for
-    commencement / 1st-anniversary / today, builds the report and saves it
+    commencement / 1st-anniversary / today, then asks for the ACTION note
+    and the three Initial Objective / Market Update / Outlook sections
+    (each skippable) so the report comes back fully written instead of
+    needing to be finished by hand in Excel. Builds the report and saves it
     straight to OneDrive under Client/<name>/, same as Policy Summary does."""
     chat_id = update.effective_chat.id
     pending_policy.pop(chat_id, None)
@@ -1232,6 +1235,10 @@ async def _build_fund_update(message, chat_id: int) -> None:
         account_value_asof=data["account_value_asof"],
         funds=fund_rows,
         ref_illustration=data.get("ref_illustration"),
+        action_notes=data.get("action_notes"),
+        initial_objective=data.get("initial_objective"),
+        market_update=data.get("market_update"),
+        outlook=data.get("outlook"),
     )
     xlsx_bytes = fund_update_workbook.build_fund_update_workbook(wb_data)
     filename = fund_update_workbook._filename(data["client_name"])
@@ -1732,6 +1739,42 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             if text.lower() != "skip":
                 remark_list = [r.strip() for r in re.split(r"[,\n]", text) if r.strip()]
                 state["remarks"] = remark_list
+            state["step"] = "action_notes"
+            await update.message.reply_text(
+                "Any notes for the ACTION line (after today's date)? Or type skip."
+            )
+            return
+
+        if step == "action_notes":
+            if text.lower() != "skip":
+                state["data"]["action_notes"] = text
+            state["step"] = "initial_objective"
+            await update.message.reply_text(
+                "Initial objective of this investment? Or type skip."
+            )
+            return
+
+        if step == "initial_objective":
+            if text.lower() != "skip":
+                state["data"]["initial_objective"] = text
+            state["step"] = "market_update"
+            await update.message.reply_text(
+                "Market update for the last 12 months? Or type skip."
+            )
+            return
+
+        if step == "market_update":
+            if text.lower() != "skip":
+                state["data"]["market_update"] = text
+            state["step"] = "outlook"
+            await update.message.reply_text(
+                "Outlook for the next 12 months? Or type skip."
+            )
+            return
+
+        if step == "outlook":
+            if text.lower() != "skip":
+                state["data"]["outlook"] = text
             await _build_fund_update(update.message, chat_id)
             return
 

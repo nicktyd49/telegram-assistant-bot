@@ -102,6 +102,15 @@ class FundUpdateData:
     funds: list[FundRow]
     ref_illustration: Optional[str] = None  # e.g. "$13,911 (8% IRR)"
     action_date_label: Optional[date] = None  # defaults to current_date
+    # Free text for the ACTION line and the three prompt boxes below the
+    # fund table. All optional — the /fundupdate wizard asks for each one
+    # with a "type skip" out, same as remarks; any left as None fall back
+    # to the bare dated/labeled placeholder exactly as before, so Nic can
+    # still finish typing them in Excel afterward if he skips in chat.
+    action_notes: Optional[str] = None
+    initial_objective: Optional[str] = None
+    market_update: Optional[str] = None
+    outlook: Optional[str] = None
 
 
 def _thin(color: str) -> Side:
@@ -301,11 +310,13 @@ def build_fund_update_workbook(data: FundUpdateData) -> bytes:
     ws.row_dimensions[last_fund_row + 1].height = 15
 
     # --- Action section -----------------------------------------------
-    # One merged, boxed, two-row cell — "ACTION:" then a dated line for
-    # Nic to continue typing his notes after.
+    # One merged, boxed, two-row cell — "ACTION:" then a dated line, with
+    # whatever Nic typed in the wizard appended after the dash. Left blank
+    # (just the dated dash) when he skipped it, same as before.
     ws.merge_cells(f"A{action_row}:G{action_end_row}")
     action_date = data.action_date_label or data.current_date
-    ws[f"A{action_row}"] = f"ACTION:\n\n{action_date:%d/%m/%Y} - "
+    action_line = f"{action_date:%d/%m/%Y} - " + (data.action_notes or "")
+    ws[f"A{action_row}"] = f"ACTION:\n\n{action_line}"
     ws[f"A{action_row}"].font = styled_font()
     ws[f"A{action_row}"].alignment = Alignment(horizontal="left", vertical="top", wrap_text=True)
     ws.row_dimensions[action_row].height = 25
@@ -313,15 +324,18 @@ def build_fund_update_workbook(data: FundUpdateData) -> bytes:
     _box(ws, f"A{action_row}:G{action_end_row}", full_grid=False)
 
     # --- Prompt sections (boxed, same as the fund table / ACTION) --------
+    # Each label stays on its own first line with whatever Nic typed for it
+    # appended below — same blank-label placeholder as before when he
+    # skipped a section, so there's still room to fill it in by hand later.
     prompts = [
-        "Initial Objective of this investment\n",
-        "Market Update in the last 12 months\n",
-        "Outlook in the next 12 months\n",
+        ("Initial Objective of this investment", data.initial_objective),
+        ("Market Update in the last 12 months", data.market_update),
+        ("Outlook in the next 12 months", data.outlook),
     ]
-    for i, prompt in enumerate(prompts):
+    for i, (label, content) in enumerate(prompts):
         r = prompt_rows_start + i
         ws.merge_cells(f"A{r}:G{r}")
-        ws[f"A{r}"] = prompt
+        ws[f"A{r}"] = f"{label}\n{content}" if content else f"{label}\n"
         ws[f"A{r}"].font = styled_font()
         ws[f"A{r}"].alignment = Alignment(vertical="top", horizontal="left", wrap_text=True)
         ws.row_dimensions[r].height = 70
