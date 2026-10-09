@@ -1260,6 +1260,16 @@ async def _build_fund_update(message, chat_id: int) -> None:
         reply_markup=main_menu_keyboard(),
     )
 
+    # Offer to go straight into the next policy for the same client instead
+    # of making him retype the name and sit through the reuse prompt again
+    # — the name is the only thing genuinely shared between two policies.
+    pending_fund_update_session[chat_id] = {
+        "step": "confirm_another_policy",
+        "data": {"client_name": data["client_name"]},
+        "funds": [],
+    }
+    await message.reply_text(f"Add another policy for {data['client_name']}? (yes/no)")
+
 
 # Persistent-keyboard button text -> handler. Checked first in handle_message
 # so tapping a button doesn't fall through to the general chat assistant.
@@ -1463,6 +1473,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         state = pending_fund_update_session[chat_id]
         step = state["step"]
         text = text_raw.strip()
+
+        if step == "confirm_another_policy":
+            answer = text.lower()
+            if answer in {"yes", "y", "yeah", "yep", "sure", "ok", "okay"}:
+                state["step"] = "product"
+                await update.message.reply_text("What's the policy product? (e.g. HSBCLife Wealth Voyage)")
+                return
+            if answer in {"no", "n", "nope"}:
+                pending_fund_update_session.pop(chat_id, None)
+                await update.message.reply_text("Okay, all done!", reply_markup=main_menu_keyboard())
+                return
+            await update.message.reply_text("Reply yes or no — add another policy for this client?")
+            return
 
         if step == "client_name":
             if not text:
