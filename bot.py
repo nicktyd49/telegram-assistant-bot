@@ -1771,15 +1771,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if step == "action_notes":
             if text.lower() != "skip":
                 state["data"]["action_notes"] = text
-            state["step"] = "initial_objective"
-            await update.message.reply_text(
-                "Initial objective of this investment? Or type skip."
-            )
-            return
-
-        if step == "initial_objective":
-            if text.lower() != "skip":
-                state["data"]["initial_objective"] = text
+            # Initial Objective isn't asked here on purpose — it's set once
+            # at the policy's inception and almost never changes between
+            # reviews, so re-asking it on every update was pure friction.
+            # Nic can still fill it in by hand in Excel, or FundUpdateData
+            # still accepts it if a future caller wants to pass it through.
             state["step"] = "market_update"
             await update.message.reply_text(
                 "Market update for the last 12 months? Or type skip."
