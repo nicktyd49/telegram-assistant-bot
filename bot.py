@@ -1238,7 +1238,7 @@ async def _build_fund_update(message, chat_id: int) -> None:
 
     saved_note = ""
     try:
-        filename = await fund_update_workbook.save_to_onedrive(data["client_name"], xlsx_bytes)
+        filename = await fund_update_workbook.save_to_onedrive(data["client_name"], wb_data, xlsx_bytes)
         saved_note = f"\n\nSaved to OneDrive under Client/{data['client_name']}/{filename}."
     except onedrive_service.OneDriveNotConfigured:
         saved_note = "\n\n(OneDrive isn't set up yet — run /onedrive_setup to have future reports saved there automatically.)"

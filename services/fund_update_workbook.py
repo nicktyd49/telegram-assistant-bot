@@ -5,6 +5,10 @@ since the anniversary, remarks — parameterized so the Telegram bot can
 generate one for any client from a short chat wizard instead of a one-off
 manual build.
 
+One workbook per client, one sheet per policy (see _sheet_title_for /
+save_to_onedrive) — a client with several ILP policies gets a tab for each
+instead of the latest update overwriting the others.
+
 Mirrors services/policy_workbook.py's conventions (OneDrive folder layout,
 filename sanitizing) but is otherwise a self-contained builder — this report
 has nothing to do with the Policy Summary sheet layout.
@@ -14,6 +18,7 @@ from __future__ import annotations
 import io
 import logging
 import re
+from copy import copy
 from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Optional
@@ -27,6 +32,10 @@ from services import onedrive_service
 
 logger = logging.getLogger("assistant-bot.fund_update_workbook")
 
+# Legacy single-sheet name, from before a client's workbook could hold more
+# than one policy. New sheets are titled per-policy (see _sheet_title_for);
+# this is kept only as a fallback for _parse_existing() reading an older
+# file that still uses it.
 SHEET_NAME = "ILP Funds Update"
 ONEDRIVE_WORKBOOK_FOLDER = "Client"
 
@@ -47,11 +56,26 @@ _HEADER_TEXT = "P R O P E R T Y O F  C A S S  N A O M I  P O H  O R G A N I S A 
 _FOOTER_TEXT = "&K03+000P R I V A T E  A N D  C O N F I D E N T I A L"
 
 _ONEDRIVE_ILLEGAL_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+_SHEET_ILLEGAL_CHARS = re.compile(r'[:\\/?*\[\]]')
 
 
 def _onedrive_safe_name(text: str | None, fallback: str = "Unknown Client") -> str:
     cleaned = _ONEDRIVE_ILLEGAL_CHARS.sub("", (text or "")).strip().rstrip(".")
     return cleaned or fallback
+
+
+def _sheet_title_for(data: "FundUpdateData") -> str:
+    """A client can hold more than one policy, so each policy gets its own
+    tab in that client's single workbook (see save_to_onedrive) instead of
+    one policy's update overwriting another's. Named after the policy
+    number — the one field that's always unique per policy — falling back
+    to the product name, then a generic label, if it's ever missing.
+    Excel sheet names can't contain : \\ / ? * [ ] and are capped at 31
+    chars, so this sanitizes and truncates the same way _onedrive_safe_name
+    does for folder/file names."""
+    raw = data.policy_number or data.product or "Policy"
+    safe = _SHEET_ILLEGAL_CHARS.sub("", raw).strip()
+    return (safe or "Policy")[:31]
 
 
 @dataclass
@@ -123,7 +147,7 @@ def build_fund_update_workbook(data: FundUpdateData) -> bytes:
     # column widths themselves.
     wb._fonts[0].sz = 12
     ws = wb.active
-    ws.title = SHEET_NAME
+    ws.title = _sheet_title_for(data)
     # Matches the reference's <sheetFormatPr> exactly (baseColWidth="10"
     # defaultColWidth="12.1640625" defaultRowHeight="25"), part of the same
     # width-basis fix above.
@@ -371,6 +395,13 @@ def _parse_existing(xlsx_bytes: bytes) -> dict:
     total invested, ref illustration, fund list + allocations) is read
     back."""
     wb = openpyxl.load_workbook(io.BytesIO(xlsx_bytes), data_only=False)
+    # A client's workbook can hold a sheet per policy now (see
+    # _sheet_title_for / save_to_onedrive). wb.active is whichever sheet was
+    # saved/updated most recently — that's the best guess for "the policy
+    # Nic probably means" when he hasn't said which one, and he gets a
+    # chance to say no if it's the wrong one (the caller shows him the
+    # policy number before offering to reuse it). SHEET_NAME is only
+    # checked first for a pre-multi-policy file that still uses it.
     ws = wb[SHEET_NAME] if SHEET_NAME in wb.sheetnames else wb.active
 
     product = ws["B1"].value
@@ -410,10 +441,13 @@ def _parse_existing(xlsx_bytes: bytes) -> dict:
 
 
 async def load_existing(client_name: str) -> Optional[dict]:
-    """Looks up this client's most recent "ILP Funds Update" report on
-    OneDrive (same path save_to_onedrive() writes to) and returns its
-    reusable fields, or None if there's no prior report for this client, or
-    it couldn't be read/parsed. Used by the /fundupdate wizard to offer
+    """Looks up this client's most recently updated policy sheet in their
+    "ILP Funds Update" workbook on OneDrive (same path save_to_onedrive()
+    writes to) and returns its reusable fields, or None if there's no prior
+    report for this client, or it couldn't be read/parsed. If the client
+    has more than one policy, this is a best guess (whichever was updated
+    last) — the /fundupdate wizard shows the policy number before offering
+    to reuse it, so Nic can say no if it's the wrong one. Used to offer
     pre-filling a repeat update instead of starting from scratch, the same
     way policy_workbook.py lets the Policy Summary wizard build on an
     existing client folder."""
@@ -438,13 +472,101 @@ async def load_existing(client_name: str) -> Optional[dict]:
         return None
 
 
-async def save_to_onedrive(client_name: str, xlsx_bytes: bytes) -> str:
+def _copy_worksheet(src: Worksheet, dst: Worksheet) -> None:
+    """Copies everything build_fund_update_workbook() sets on a sheet — cell
+    values/styles, merges, column/row sizing, hidden columns, sheet view,
+    page setup, header/footer — from src into dst. openpyxl has no built-in
+    cross-workbook sheet copy, so this does it cell-by-cell. Used by
+    _merge_sheet() to add a policy's sheet into a client's existing
+    workbook without disturbing any other policy's sheet already in it."""
+    for row in src.iter_rows():
+        for cell in row:
+            new_cell = dst.cell(row=cell.row, column=cell.column, value=cell.value)
+            if cell.has_style:
+                new_cell.font = copy(cell.font)
+                new_cell.border = copy(cell.border)
+                new_cell.fill = copy(cell.fill)
+                new_cell.alignment = copy(cell.alignment)
+                new_cell.protection = copy(cell.protection)
+                new_cell.number_format = cell.number_format
+
+    for merged_range in src.merged_cells.ranges:
+        dst.merge_cells(str(merged_range))
+
+    for col, dim in src.column_dimensions.items():
+        dst.column_dimensions[col].width = dim.width
+        dst.column_dimensions[col].hidden = dim.hidden
+
+    for row_idx, dim in src.row_dimensions.items():
+        dst.row_dimensions[row_idx].height = dim.height
+
+    dst.sheet_format.baseColWidth = src.sheet_format.baseColWidth
+    dst.sheet_format.defaultColWidth = src.sheet_format.defaultColWidth
+    dst.sheet_format.defaultRowHeight = src.sheet_format.defaultRowHeight
+
+    dst.sheet_view.showGridLines = src.sheet_view.showGridLines
+    dst.sheet_view.zoomScale = src.sheet_view.zoomScale
+    dst.sheet_view.zoomScaleNormal = src.sheet_view.zoomScaleNormal
+
+    dst.page_setup.orientation = src.page_setup.orientation
+    dst.page_setup.fitToWidth = src.page_setup.fitToWidth
+    dst.page_setup.fitToHeight = src.page_setup.fitToHeight
+    dst.sheet_properties.pageSetUpPr.fitToPage = src.sheet_properties.pageSetUpPr.fitToPage
+    dst.page_margins.left = src.page_margins.left
+    dst.page_margins.right = src.page_margins.right
+    dst.page_margins.top = src.page_margins.top
+    dst.page_margins.bottom = src.page_margins.bottom
+    dst.page_margins.header = src.page_margins.header
+    dst.page_margins.footer = src.page_margins.footer
+
+    dst.oddHeader.center.text = src.oddHeader.center.text
+    dst.oddFooter.center.text = src.oddFooter.center.text
+
+
+def _merge_sheet(existing_bytes: bytes, sheet_title: str, new_sheet_bytes: bytes) -> bytes:
+    """Adds/replaces one policy's sheet inside a client's existing workbook,
+    leaving every other sheet (other policies for the same client) intact.
+    new_sheet_bytes is a standalone single-sheet workbook as returned by
+    build_fund_update_workbook(); existing_bytes is whatever's currently
+    saved at that client's OneDrive path."""
+    target_wb = openpyxl.load_workbook(io.BytesIO(existing_bytes))
+    source_ws = openpyxl.load_workbook(io.BytesIO(new_sheet_bytes)).active
+
+    if sheet_title in target_wb.sheetnames:
+        del target_wb[sheet_title]
+    target_ws = target_wb.create_sheet(title=sheet_title)
+    _copy_worksheet(source_ws, target_ws)
+    target_wb.active = target_wb.sheetnames.index(sheet_title)
+
+    buf = io.BytesIO()
+    target_wb.save(buf)
+    return buf.getvalue()
+
+
+async def save_to_onedrive(client_name: str, data: FundUpdateData, xlsx_bytes: bytes) -> str:
     """Uploads the workbook to Client/<name>/ on OneDrive (same convention as
-    policy_workbook.py), overwriting any previous fund-update report for this
-    client. Returns the filename used. Raises whatever onedrive_service
-    raises (e.g. OneDriveNotConfigured) — caller decides how to surface that
-    to Nic; the file itself is still fine to send over Telegram either way."""
+    policy_workbook.py). A client can have more than one policy, so rather
+    than overwriting the whole file, this adds/replaces just this policy's
+    sheet (named by policy number — see _sheet_title_for) inside whatever
+    workbook's already there, keeping every other policy's sheet intact.
+    The new/updated sheet is left as the active tab, so load_existing()'s
+    "most recent" fallback picks it up correctly. Returns the filename
+    used. Raises whatever onedrive_service raises (e.g.
+    OneDriveNotConfigured) — caller decides how to surface that to Nic; the
+    file itself is still fine to send over Telegram either way."""
     filename = _filename(client_name)
     remote_path = _onedrive_remote_path(client_name, filename)
+
+    # download_bytes() returns None only for a genuine 404 (no prior report
+    # for this client — the normal case for someone's first policy) and
+    # raises for any real error. A real error has to propagate rather than
+    # be treated as "no existing file": silently falling back to a fresh
+    # single-sheet workbook here would overwrite and destroy any other
+    # policy's sheet already saved for this client.
+    existing_bytes = await onedrive_service.download_bytes(remote_path)
+
+    if existing_bytes:
+        xlsx_bytes = _merge_sheet(existing_bytes, _sheet_title_for(data), xlsx_bytes)
+
     await onedrive_service.upload_bytes(remote_path, xlsx_bytes)
     return filename
