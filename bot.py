@@ -1094,7 +1094,10 @@ async def _menu_ig(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 def _done_fund_keyboard() -> InlineKeyboardMarkup:
     """Shown once at least one fund has been added to an active Fund Update session."""
-    return InlineKeyboardMarkup([[InlineKeyboardButton("✅ Done Adding Funds", callback_data="funddone")]])
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("↩️ Undo Last Fund", callback_data="fundundo"),
+        InlineKeyboardButton("✅ Done Adding Funds", callback_data="funddone"),
+    ]])
 
 
 def _existing_is_usable(existing: dict | None) -> bool:
@@ -1214,6 +1217,48 @@ async def fund_done_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
     await query.answer()
     await _finish_fund_list(query.message, update.effective_chat.id)
+
+
+async def _fund_undo(message, chat_id: int) -> None:
+    """Removes the last fund added to the in-progress /fundupdate session,
+    if there is one - shared by the plain-text "undo" at the fund_name step
+    and the "Undo Last Fund" button, so a mistyped/misresolved fund (e.g. a
+    fuzzy name match that found the wrong fund) can be taken back without
+    restarting the whole report. This only ever touches the in-progress
+    fund list in memory; nothing has been saved to OneDrive yet at this
+    point in the wizard, so there's nothing to undo there."""
+    state = pending_fund_update_session.get(chat_id)
+    if not state:
+        await message.reply_text(
+            "There's no fund-update in progress right now for me to undo a fund from."
+        )
+        return
+    if state.get("step") != "fund_name":
+        # The button can still be tapped from an earlier message after the
+        # session has moved on to a different step (e.g. confirming/pricing
+        # another fund) - nothing to safely undo mid-step.
+        await message.reply_text(
+            "Finish or skip what you're entering right now first, then you can undo the last fund."
+        )
+        return
+    if state["funds"]:
+        removed = state["funds"].pop()
+        await message.reply_text(
+            f"Removed {removed['name']} ({removed['allocation_pct']:.0f}%). "
+            "Send the next fund's name, or type done if that's all.",
+            reply_markup=_done_fund_keyboard() if state["funds"] else None,
+        )
+    else:
+        await message.reply_text("No funds added yet — nothing to undo.")
+
+
+async def fund_undo_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not _is_allowed(update):
+        await query.answer()
+        return
+    await query.answer()
+    await _fund_undo(query.message, update.effective_chat.id)
 
 
 async def _fetch_fund_rows_and_draft(message, chat_id: int, state: dict) -> None:
@@ -1823,14 +1868,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 await _finish_fund_list(update.message, chat_id)
                 return
             if text.lower() in {"undo", "undo last", "remove last"}:
-                if state["funds"]:
-                    removed = state["funds"].pop()
-                    await update.message.reply_text(
-                        f"Removed {removed['name']} ({removed['allocation_pct']:.0f}%). "
-                        "Send the next fund's name, or type done if that's all."
-                    )
-                else:
-                    await update.message.reply_text("No funds added yet — nothing to undo.")
+                await _fund_undo(update.message, chat_id)
                 return
             if not text:
                 await update.message.reply_text("Send a fund name, or type done if you're finished.")
@@ -2845,6 +2883,7 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(ig_regen_callback, pattern=r"^igregen$"))
     app.add_handler(CallbackQueryHandler(ig_discard_callback, pattern=r"^igdiscard$"))
     app.add_handler(CallbackQueryHandler(fund_done_callback, pattern=r"^funddone$"))
+    app.add_handler(CallbackQueryHandler(fund_undo_callback, pattern=r"^fundundo$"))
     app.add_handler(MessageHandler(filters.Document.PDF, handle_policy_or_receipt_pdf))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.Document.ALL & ~filters.Document.PDF, handle_generic_document))
