@@ -153,6 +153,8 @@ SEED_FUNDS: dict[str, dict] = {
     "Capital Group Global High Income Opportunities (LUX) Bfdmh-SGD": {"code": "F00000ZOBE", "currency": "SGD"},
     "Capital Group Global High Income Opportunities (LUX) Bfdm": {"code": "F00000YYP0", "currency": "USD"},
     "BlackRock Global Funds - World Technology Fund A2": {"code": "F0GBR04AMX", "currency": "USD"},
+    "Franklin Technology Fund A (Acc) SGD-H1": {"code": "F000010EYV", "currency": "SGD"},
+    "Franklin Technology Fund A (Acc) USD": {"code": "F0GBR04V77", "currency": "USD"},
     "BlackRock Global Funds - World Mining Fund A2 SGD Hedged": {"code": "F000000RN7", "currency": "SGD"},
     "BlackRock Global Funds - World Healthscience Fund A2": {"code": "F0GBR04K8L", "currency": "USD"},
     "BlackRock Global Funds - World Gold Fund A2 SGD Hedged": {"code": "F000002GJV", "currency": "SGD"},
