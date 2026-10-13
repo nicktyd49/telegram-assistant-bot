@@ -1136,6 +1136,43 @@ async def _advance_reuse_queue(message, chat_id: int) -> None:
     await message.reply_text(f"Reusing {len(state['funds'])} fund(s). Current account value?")
 
 
+async def _apply_policy_reuse(message, chat_id: int, state: dict, existing: dict) -> None:
+    """Carries an existing policy's reusable fields (product, policy#,
+    commencement date, total invested, fund list) into the in-progress
+    wizard session, resolving each fund against the directory and queuing
+    up a manual-code prompt for any that can't be found anymore. Shared by
+    the single-policy "confirm_reuse" yes path and the multi-policy
+    "choose_policy" picker, so both land in the same place."""
+    state["data"]["product"] = existing["product"]
+    state["data"]["policy_number"] = existing["policy_number"]
+    state["data"]["commencement_date"] = existing["commencement_date"]
+    state["data"]["total_invested"] = existing["total_invested"]
+    state["data"]["ref_illustration"] = existing.get("ref_illustration")
+    state["data"]["_reusing"] = True
+
+    resolved_funds = []
+    reuse_queue = []
+    for f in existing["funds"]:
+        resolved = fund_price_service.resolve_fund(f["name"])
+        if resolved:
+            resolved_funds.append({
+                "name": resolved.display_name,
+                "code": resolved.code,
+                "currency": resolved.currency,
+                "allocation_pct": f["allocation_pct"],
+            })
+        else:
+            reuse_queue.append(f)
+    state["funds"] = resolved_funds
+    state["reuse_fund_queue"] = reuse_queue
+
+    if reuse_queue:
+        await _advance_reuse_queue(message, chat_id)
+    else:
+        state["step"] = "account_value"
+        await message.reply_text(f"Reusing {len(resolved_funds)} fund(s). Current account value?")
+
+
 async def _menu_fund_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Starts an 'ILP Funds Update' session - walks through the policy
     details and fund allocations in chat, fetches live NAV from HSBC for
@@ -1600,12 +1637,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 return
             state["data"]["client_name"] = text
 
-            existing = None
+            policies = None
             try:
-                existing = await fund_update_workbook.load_existing(text)
+                policies = await fund_update_workbook.list_existing_policies(text)
             except Exception:
                 logger.exception("Failed to look up existing fund update report for %s", text)
-            if _existing_is_usable(existing):
+            usable = [p for p in (policies or []) if _existing_is_usable(p)]
+
+            if len(usable) == 1:
+                existing = usable[0]
                 state["existing"] = existing
                 state["step"] = "confirm_reuse"
                 funds = existing["funds"]
@@ -1621,44 +1661,54 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 )
                 return
 
+            if len(usable) >= 2:
+                state["existing_policies"] = usable
+                state["step"] = "choose_policy"
+                lines = "\n".join(
+                    f"  {i + 1}. {p['policy_number']} — {p['product']} (${p['total_invested']:,.0f} invested)"
+                    for i, p in enumerate(usable)
+                )
+                await update.message.reply_text(
+                    f"{text} has {len(usable)} existing policies:\n{lines}\n\n"
+                    "Reply with a number to reuse that policy's details, or type `new` to add a different policy."
+                )
+                return
+
             state["step"] = "product"
             await update.message.reply_text("What's the policy product? (e.g. HSBCLife Wealth Voyage)")
+            return
+
+        if step == "choose_policy":
+            if text.lower() in {"new", "none", "different", "no"}:
+                state.pop("existing_policies", None)
+                state["step"] = "product"
+                await update.message.reply_text("Okay, starting fresh. What's the policy product? (e.g. HSBCLife Wealth Voyage)")
+                return
+            policies = state.get("existing_policies") or []
+            choice = None
+            if text.strip().isdigit():
+                idx = int(text.strip()) - 1
+                if 0 <= idx < len(policies):
+                    choice = policies[idx]
+            if choice is None:
+                for p in policies:
+                    if str(p.get("policy_number", "")).strip().lower() == text.strip().lower():
+                        choice = p
+                        break
+            if choice is None:
+                await update.message.reply_text(
+                    "Reply with the number of the policy to reuse, or type `new` to add a different policy."
+                )
+                return
+            state.pop("existing_policies", None)
+            await _apply_policy_reuse(update.message, chat_id, state, choice)
             return
 
         if step == "confirm_reuse":
             answer = text.lower()
             if answer in {"yes", "y", "yeah", "yep", "sure", "ok", "okay"}:
                 existing = state.pop("existing")
-                state["data"]["product"] = existing["product"]
-                state["data"]["policy_number"] = existing["policy_number"]
-                state["data"]["commencement_date"] = existing["commencement_date"]
-                state["data"]["total_invested"] = existing["total_invested"]
-                state["data"]["ref_illustration"] = existing.get("ref_illustration")
-                state["data"]["_reusing"] = True
-
-                resolved_funds = []
-                reuse_queue = []
-                for f in existing["funds"]:
-                    resolved = fund_price_service.resolve_fund(f["name"])
-                    if resolved:
-                        resolved_funds.append({
-                            "name": resolved.display_name,
-                            "code": resolved.code,
-                            "currency": resolved.currency,
-                            "allocation_pct": f["allocation_pct"],
-                        })
-                    else:
-                        reuse_queue.append(f)
-                state["funds"] = resolved_funds
-                state["reuse_fund_queue"] = reuse_queue
-
-                if reuse_queue:
-                    await _advance_reuse_queue(update.message, chat_id)
-                else:
-                    state["step"] = "account_value"
-                    await update.message.reply_text(
-                        f"Reusing {len(resolved_funds)} fund(s). Current account value?"
-                    )
+                await _apply_policy_reuse(update.message, chat_id, state, existing)
                 return
 
             if answer in {"no", "n", "nope"}:

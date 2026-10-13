@@ -399,25 +399,16 @@ def _parse_dollar_amount(value) -> Optional[float]:
         return None
 
 
-def _parse_existing(xlsx_bytes: bytes) -> dict:
-    """Reads back the fields build_fund_update_workbook() wrote into a
-    previous report, so a repeat /fundupdate for the same client can reuse
+def _parse_sheet(ws: Worksheet) -> dict:
+    """Reads back the fields build_fund_update_workbook() wrote into one
+    policy sheet, so a repeat /fundupdate for the same client can reuse
     them instead of re-asking from scratch. Live fund prices, the
     1st-anniversary date and "current" date are never reused here — those
     get recomputed/refetched fresh on every update; only the data this
     function can't recompute (product, policy number, commencement date,
     total invested, ref illustration, fund list + allocations) is read
-    back."""
-    wb = openpyxl.load_workbook(io.BytesIO(xlsx_bytes), data_only=False)
-    # A client's workbook can hold a sheet per policy now (see
-    # _sheet_title_for / save_to_onedrive). wb.active is whichever sheet was
-    # saved/updated most recently — that's the best guess for "the policy
-    # Nic probably means" when he hasn't said which one, and he gets a
-    # chance to say no if it's the wrong one (the caller shows him the
-    # policy number before offering to reuse it). SHEET_NAME is only
-    # checked first for a pre-multi-policy file that still uses it.
-    ws = wb[SHEET_NAME] if SHEET_NAME in wb.sheetnames else wb.active
-
+    back. Shared by _parse_existing() (single best-guess sheet) and
+    list_existing_policies() (every sheet, for the policy picker)."""
     product = ws["B1"].value
     policy_number = ws["B2"].value
 
@@ -445,6 +436,7 @@ def _parse_existing(xlsx_bytes: bytes) -> dict:
         r += 1
 
     return {
+        "sheet_title": ws.title,
         "product": product,
         "policy_number": policy_number,
         "commencement_date": commencement_date,
@@ -454,17 +446,28 @@ def _parse_existing(xlsx_bytes: bytes) -> dict:
     }
 
 
+def _parse_existing(xlsx_bytes: bytes) -> dict:
+    """Reads back one policy's reusable fields - see _parse_sheet(). Picks
+    wb.active (whichever sheet was saved/updated most recently) as the best
+    guess for "the policy Nic probably means" when he hasn't said which one
+    and the client has only one usable policy; list_existing_policies()
+    is used instead whenever there's more than one, so he can choose.
+    SHEET_NAME is only checked first for a pre-multi-policy file that still
+    uses it."""
+    wb = openpyxl.load_workbook(io.BytesIO(xlsx_bytes), data_only=False)
+    ws = wb[SHEET_NAME] if SHEET_NAME in wb.sheetnames else wb.active
+    return _parse_sheet(ws)
+
+
 async def load_existing(client_name: str) -> Optional[dict]:
     """Looks up this client's most recently updated policy sheet in their
     "ILP Funds Update" workbook on OneDrive (same path save_to_onedrive()
     writes to) and returns its reusable fields, or None if there's no prior
     report for this client, or it couldn't be read/parsed. If the client
     has more than one policy, this is a best guess (whichever was updated
-    last) — the /fundupdate wizard shows the policy number before offering
-    to reuse it, so Nic can say no if it's the wrong one. Used to offer
-    pre-filling a repeat update instead of starting from scratch, the same
-    way policy_workbook.py lets the Policy Summary wizard build on an
-    existing client folder."""
+    last) — kept around for callers that only want a single best-effort
+    guess. The /fundupdate wizard itself now uses list_existing_policies()
+    instead, so Nic gets to pick when there's more than one."""
     filename = _filename(client_name)
     remote_path = _onedrive_remote_path(client_name, filename)
     try:
@@ -479,6 +482,47 @@ async def load_existing(client_name: str) -> Optional[dict]:
         return None
     try:
         return _parse_existing(xlsx_bytes)
+    except Exception:
+        logger.exception(
+            "Failed to parse existing fund update report (client=%s)", client_name
+        )
+        return None
+
+
+async def list_existing_policies(client_name: str) -> Optional[list[dict]]:
+    """Looks up every policy sheet in this client's "ILP Funds Update"
+    workbook on OneDrive and returns each sheet's reusable fields (see
+    _parse_sheet()), most-recently-updated first — including sheets that
+    turn out not to have enough fields to reuse; the caller filters those
+    out (see _existing_is_usable() in bot.py) before offering them as
+    choices. Returns None if there's no prior report for this client, or
+    it couldn't be read; returns an empty list if the workbook has no
+    sheets at all. The /fundupdate wizard uses this instead of
+    load_existing() so that a client with several policies gets a picker
+    instead of a silent best guess."""
+    filename = _filename(client_name)
+    remote_path = _onedrive_remote_path(client_name, filename)
+    try:
+        xlsx_bytes = await onedrive_service.download_bytes(remote_path)
+    except Exception:
+        logger.exception(
+            "Failed to check OneDrive for an existing fund update report (client=%s)",
+            client_name,
+        )
+        return None
+    if xlsx_bytes is None:
+        return None
+    try:
+        wb = openpyxl.load_workbook(io.BytesIO(xlsx_bytes), data_only=False)
+        # wb.active is whichever sheet was saved/updated most recently -
+        # list it first so a single-policy client (the common case) still
+        # sees their one policy as the obvious/default choice.
+        titles = list(wb.sheetnames)
+        active_title = wb.active.title
+        if active_title in titles:
+            titles.remove(active_title)
+            titles.insert(0, active_title)
+        return [_parse_sheet(wb[title]) for title in titles]
     except Exception:
         logger.exception(
             "Failed to parse existing fund update report (client=%s)", client_name
