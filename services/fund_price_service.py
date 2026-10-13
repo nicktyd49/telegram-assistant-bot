@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 from pathlib import Path
@@ -45,6 +46,13 @@ logger = logging.getLogger("assistant-bot.fund_price")
 
 API_URL = "https://fundprices.insurance.hsbc.com.sg/fund-center-api/hsbc/ts/external"
 REQUEST_TIMEOUT = 30
+# HSBC's API occasionally returns a thin/incomplete payload (Security present
+# but no HistoryDetail key at all) under the burst of several rapid requests
+# one /fundupdate report fires - re-querying the exact same code/date window
+# moments later has reliably succeeded, so this is treated as transient and
+# retried a couple of times before giving up on that fund.
+PRICE_FETCH_RETRIES = 2
+PRICE_FETCH_RETRY_DELAY_SECONDS = 1.5
 
 # Seed directory: fund display name -> (security id, currency). Keys are
 # matched case-insensitively and by loose substring, so Nic doesn't have to
@@ -288,7 +296,15 @@ def fetch_price(code: str, currency: str, target_date: date) -> FundPricePoint:
     """Fetches the NAV for one security as of target_date. Requests a short
     window ending on target_date (rather than that single day) so weekends
     and holidays resolve to the last real trading value, matching what the
-    fund's own NAV chart shows when hovered on that date."""
+    fund's own NAV chart shows when hovered on that date.
+
+    Retries up to PRICE_FETCH_RETRIES times (with a short delay) on a
+    connection/timeout failure or a thin response missing the HistoryDetail
+    key entirely - both have been observed to be transient hiccups from
+    HSBC's side under the burst of several requests one /fundupdate report
+    fires, not a real problem with the fund/date. A well-formed response
+    with a genuinely empty history (e.g. the fund has no data this early)
+    is NOT retried, since retrying can't fix that."""
     from_date = target_date - timedelta(days=12)
     params = {
         "code": code,
@@ -299,39 +315,49 @@ def fetch_price(code: str, currency: str, target_date: date) -> FundPricePoint:
         "start_value": "100",
         "ts_type": "nav",
     }
-    try:
-        resp = requests.get(API_URL, params=params, timeout=REQUEST_TIMEOUT)
-        resp.raise_for_status()
-        payload = resp.json()
-    except Exception as exc:  # noqa: BLE001
-        raise FundPriceError(f"Couldn't reach HSBC's fund price API for {code}: {exc}") from exc
 
-    try:
-        securities = payload["TimeSeries"]["Security"]
-        history = securities[0]["HistoryDetail"]
-    except (KeyError, IndexError, TypeError) as exc:
-        raise FundPriceError(f"Unexpected response shape from HSBC for {code}: {payload}") from exc
-
-    if not history:
-        raise FundPriceError(
-            f"No price history returned for {code} in the window ending {target_date:%d/%m/%Y}."
-        )
-
-    latest = history[-1]
-    try:
-        value = float(latest["Value"])
-    except (KeyError, TypeError, ValueError) as exc:
-        raise FundPriceError(f"Couldn't parse a NAV value for {code}: {latest}") from exc
-
-    as_of_raw = latest.get("OriginalDate") or latest.get("EndDate")
-    as_of = target_date
-    if as_of_raw:
+    last_error: Optional[FundPriceError] = None
+    for attempt in range(PRICE_FETCH_RETRIES + 1):
+        if attempt:
+            time.sleep(PRICE_FETCH_RETRY_DELAY_SECONDS)
         try:
-            as_of = date.fromisoformat(str(as_of_raw)[:10])
-        except ValueError:
-            pass
+            resp = requests.get(API_URL, params=params, timeout=REQUEST_TIMEOUT)
+            resp.raise_for_status()
+            payload = resp.json()
+        except Exception as exc:  # noqa: BLE001
+            last_error = FundPriceError(f"Couldn't reach HSBC's fund price API for {code}: {exc}")
+            continue
 
-    return FundPricePoint(value=value, as_of=as_of)
+        try:
+            securities = payload["TimeSeries"]["Security"]
+            history = securities[0]["HistoryDetail"]
+        except (KeyError, IndexError, TypeError):
+            last_error = FundPriceError(f"Unexpected response shape from HSBC for {code}: {payload}")
+            continue
+
+        if not history:
+            raise FundPriceError(
+                f"No price history returned for {code} in the window ending {target_date:%d/%m/%Y}."
+            )
+
+        latest = history[-1]
+        try:
+            value = float(latest["Value"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise FundPriceError(f"Couldn't parse a NAV value for {code}: {latest}") from exc
+
+        as_of_raw = latest.get("OriginalDate") or latest.get("EndDate")
+        as_of = target_date
+        if as_of_raw:
+            try:
+                as_of = date.fromisoformat(str(as_of_raw)[:10])
+            except ValueError:
+                pass
+
+        return FundPricePoint(value=value, as_of=as_of)
+
+    assert last_error is not None  # the loop always sets this before exhausting retries
+    raise last_error
 
 
 def fetch_prices(code: str, currency: str, target_dates: list[date]) -> dict[date, FundPricePoint]:
