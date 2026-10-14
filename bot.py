@@ -147,6 +147,46 @@ def _parse_amount(text: str) -> float | None:
         return None
 
 
+def _split_amount_and_date(text: str) -> tuple[str, str]:
+    """Splits combined "<amount>, <date>" input (e.g. "15000, today" or
+    "15,000, 13/10/2026") into its two parts, so the fund-update wizard can
+    ask for the account value and its as-of date in one message instead of
+    two. Only treats the text after the LAST comma as the date if it
+    actually looks like one (or is "today") - that way an amount typed with
+    a thousands separator and no date at all (e.g. "15,000") isn't
+    mis-split, and just defaults to "today" instead."""
+    if "," in text:
+        amount_part, _, date_part = text.rpartition(",")
+        date_part = date_part.strip()
+        if date_part.lower() == "today" or _parse_date(date_part) is not None:
+            return amount_part.strip(), date_part
+    return text.strip(), "today"
+
+
+def _split_fund_name_and_allocation(text: str) -> tuple[str, float | None]:
+    """Lets Nic send a fund's name and allocation % in one message (e.g.
+    "BlackRock World Healthscience, 25" or "...25%") instead of two
+    separate round trips. Only splits off a trailing allocation when it's
+    unambiguous - after a comma, or the text ends in "%" - so a fund name
+    that happens to contain a number (e.g. "World Technology Fund A2") is
+    never mistaken for one with an allocation attached. Returns the
+    (possibly unmodified) fund name text and the allocation if one was
+    found, else None."""
+    text = text.strip()
+    if "," in text:
+        name_part, _, alloc_part = text.rpartition(",")
+        alloc = _parse_amount(alloc_part.strip().rstrip("%"))
+        if alloc is not None and name_part.strip():
+            return name_part.strip(), alloc
+    if text.endswith("%"):
+        m = re.match(r"^(.*\S)\s+(\d+(?:\.\d+)?)\s*%$", text)
+        if m:
+            alloc = _parse_amount(m.group(2))
+            if alloc is not None:
+                return m.group(1).strip(), alloc
+    return text, None
+
+
 def main_menu_keyboard() -> ReplyKeyboardMarkup:
     """The persistent row of buttons at the bottom of the chat."""
     return ReplyKeyboardMarkup(
@@ -1136,7 +1176,10 @@ async def _advance_reuse_queue(message, chat_id: int) -> None:
         )
         return
     state["step"] = "account_value"
-    await message.reply_text(f"Reusing {len(state['funds'])} fund(s). Current account value?")
+    await message.reply_text(
+        f"Reusing {len(state['funds'])} fund(s). Current account value, and as of what date? "
+        "e.g. \"15000, today\" (just the amount defaults to today)."
+    )
 
 
 async def _apply_policy_reuse(message, chat_id: int, state: dict, existing: dict) -> None:
@@ -1173,7 +1216,10 @@ async def _apply_policy_reuse(message, chat_id: int, state: dict, existing: dict
         await _advance_reuse_queue(message, chat_id)
     else:
         state["step"] = "account_value"
-        await message.reply_text(f"Reusing {len(resolved_funds)} fund(s). Current account value?")
+        await message.reply_text(
+            f"Reusing {len(resolved_funds)} fund(s). Current account value, and as of what date? "
+            "e.g. \"15000, today\" (just the amount defaults to today)."
+        )
 
 
 async def _menu_fund_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1194,6 +1240,23 @@ async def _menu_fund_update(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     pending_ig_preview.pop(chat_id, None)
     pending_fund_update_session[chat_id] = {"step": "client_name", "data": {}, "funds": []}
     await update.message.reply_text("Who's this ILP Funds Update for? Send the client's name.")
+
+
+async def _prompt_policy_details(message, *, fresh_start: bool = False) -> None:
+    """Shared prompt for the combined policy_details step - product, policy
+    number, commencement date and total invested all asked for in one
+    message instead of four separate round trips. Sent from every place a
+    fresh (non-reuse) policy begins: a new client's first policy, choosing
+    "new" from the multi-policy picker, declining a reuse offer, or adding
+    a second policy for the same client."""
+    prefix = "Okay, starting fresh. " if fresh_start else ""
+    await message.reply_text(
+        f"{prefix}Now the policy details — reply with each on its own line:\n"
+        "1. Product (e.g. HSBC Life Wealth Voyage)\n"
+        "2. Policy number\n"
+        "3. Commencement date (DD/MM/YYYY)\n"
+        "4. Total amount invested (e.g. 9600)"
+    )
 
 
 async def _finish_fund_list(message, chat_id: int) -> None:
@@ -1245,7 +1308,7 @@ async def _fund_undo(message, chat_id: int) -> None:
         removed = state["funds"].pop()
         await message.reply_text(
             f"Removed {removed['name']} ({removed['allocation_pct']:.0f}%). "
-            "Send the next fund's name, or type done if that's all.",
+            "Send the next fund (name + allocation %, or just the name), or type done if that's all.",
             reply_markup=_done_fund_keyboard() if state["funds"] else None,
         )
     else:
@@ -1259,6 +1322,18 @@ async def fund_undo_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
     await query.answer()
     await _fund_undo(query.message, update.effective_chat.id)
+
+
+def _add_fund(state: dict, name: str, code: str, currency: str, allocation_pct: float) -> float:
+    """Appends a resolved fund to the in-progress /fundupdate session's
+    fund list and returns the running total allocation % so far, so every
+    call site that adds a fund (the inline "name, allocation%" fast path,
+    the fallback allocation-only step, and the manual-code path) reports
+    the same running total consistently."""
+    state["funds"].append({
+        "name": name, "code": code, "currency": currency, "allocation_pct": allocation_pct,
+    })
+    return sum(f["allocation_pct"] for f in state["funds"])
 
 
 async def _fetch_fund_rows_and_draft(message, chat_id: int, state: dict) -> None:
@@ -1666,8 +1741,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if step == "confirm_another_policy":
             answer = text.lower()
             if answer in {"yes", "y", "yeah", "yep", "sure", "ok", "okay"}:
-                state["step"] = "product"
-                await update.message.reply_text("What's the policy product? (e.g. HSBCLife Wealth Voyage)")
+                state["step"] = "policy_details"
+                await _prompt_policy_details(update.message)
                 return
             if answer in {"no", "n", "nope"}:
                 pending_fund_update_session.pop(chat_id, None)
@@ -1719,15 +1794,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 )
                 return
 
-            state["step"] = "product"
-            await update.message.reply_text("What's the policy product? (e.g. HSBCLife Wealth Voyage)")
+            state["step"] = "policy_details"
+            await _prompt_policy_details(update.message)
             return
 
         if step == "choose_policy":
             if text.lower() in {"new", "none", "different", "no"}:
                 state.pop("existing_policies", None)
-                state["step"] = "product"
-                await update.message.reply_text("Okay, starting fresh. What's the policy product? (e.g. HSBCLife Wealth Voyage)")
+                state["step"] = "policy_details"
+                await _prompt_policy_details(update.message, fresh_start=True)
                 return
             policies = state.get("existing_policies") or []
             choice = None
@@ -1758,8 +1833,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
             if answer in {"no", "n", "nope"}:
                 state.pop("existing", None)
-                state["step"] = "product"
-                await update.message.reply_text("Okay, starting fresh. What's the policy product? (e.g. HSBCLife Wealth Voyage)")
+                state["step"] = "policy_details"
+                await _prompt_policy_details(update.message, fresh_start=True)
                 return
 
             await update.message.reply_text("Reply yes or no — reuse the existing details?")
@@ -1792,61 +1867,66 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             await _advance_reuse_queue(update.message, chat_id)
             return
 
-        if step == "product":
-            state["data"]["product"] = text or "—"
-            state["step"] = "policy_number"
-            await update.message.reply_text("Policy number?")
-            return
-
-        if step == "policy_number":
-            state["data"]["policy_number"] = text or "—"
-            state["step"] = "commencement_date"
-            await update.message.reply_text("Commencement date? (DD/MM/YYYY)")
-            return
-
-        if step == "commencement_date":
-            d = _parse_date(text)
+        if step == "policy_details":
+            lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+            if len(lines) != 4:
+                await update.message.reply_text(
+                    "I need all 4, each on its own line:\n"
+                    "1. Product\n2. Policy number\n3. Commencement date (DD/MM/YYYY)\n4. Total amount invested\n\n"
+                    f"Got {len(lines)} line(s) — resend all 4."
+                )
+                return
+            product, policy_number, date_str, amount_str = lines
+            d = _parse_date(date_str)
             if d is None:
-                await update.message.reply_text("Couldn't read that date — please send it as DD/MM/YYYY.")
+                await update.message.reply_text(
+                    f"Couldn't read \"{date_str}\" as the commencement date (line 3) — resend all 4 lines, "
+                    "with the date as DD/MM/YYYY."
+                )
                 return
-            state["data"]["commencement_date"] = d
-            state["step"] = "total_invested"
-            await update.message.reply_text("Total amount invested? (just the number, e.g. 9600)")
-            return
-
-        if step == "total_invested":
-            v = _parse_amount(text)
+            v = _parse_amount(amount_str)
             if v is None:
-                await update.message.reply_text("Couldn't read that as a number — how much was invested in total?")
+                await update.message.reply_text(
+                    f"Couldn't read \"{amount_str}\" as the total invested (line 4) — resend all 4 lines."
+                )
                 return
+            state["data"]["product"] = product or "—"
+            state["data"]["policy_number"] = policy_number or "—"
+            state["data"]["commencement_date"] = d
             state["data"]["total_invested"] = v
             state["step"] = "account_value"
-            await update.message.reply_text("Current account value?")
+            await update.message.reply_text(
+                "Current account value, and as of what date? e.g. \"15000, today\" or \"15000, 13/10/2026\" "
+                "(just the amount defaults to today)."
+            )
             return
 
         if step == "account_value":
-            v = _parse_amount(text)
+            amount_str, date_str = _split_amount_and_date(text)
+            v = _parse_amount(amount_str)
             if v is None:
-                await update.message.reply_text("Couldn't read that as a number — what's the current account value?")
+                await update.message.reply_text(
+                    "Couldn't read that as a number — what's the current account value? "
+                    "(e.g. \"15000, today\" or \"15000, 13/10/2026\")"
+                )
+                return
+            d = _parse_date(date_str)
+            if d is None:
+                await update.message.reply_text(
+                    f"Got the amount, but couldn't read \"{date_str}\" as a date — resend as "
+                    "\"amount, DD/MM/YYYY\" or \"amount, today\"."
+                )
                 return
             state["data"]["account_value"] = v
-            state["step"] = "account_value_date"
-            await update.message.reply_text("As of what date? (DD/MM/YYYY, or send 'today')")
-            return
-
-        if step == "account_value_date":
-            d = _parse_date(text)
-            if d is None:
-                await update.message.reply_text("Couldn't read that date — please send it as DD/MM/YYYY, or 'today'.")
-                return
             state["data"]["account_value_asof"] = d
             if state["data"].get("_reusing"):
                 state["step"] = "fund_name"
                 names = ", ".join(f["name"] for f in state["funds"]) or "none yet"
                 await update.message.reply_text(
                     f"Current funds: {names}.\n\n"
-                    "Send another fund name to add one, tap Done if the allocation is unchanged, "
-                    "or type done."
+                    "Send another fund to add one — name and allocation % together (e.g. \"BlackRock "
+                    "World Healthscience, 25\"), or just the name and I'll ask for the %. Tap Done if "
+                    "the allocation is unchanged, or type done."
                 , reply_markup=_done_fund_keyboard())
                 return
             state["step"] = "ref_illustration"
@@ -1859,7 +1939,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             state["data"]["ref_illustration"] = None if text.lower() == "skip" else text
             state["step"] = "fund_name"
             await update.message.reply_text(
-                "Now the funds. Send the first fund's name (e.g. BlackRock World Healthscience (USD))."
+                "Now the funds. Send a fund's name and allocation % together (e.g. \"BlackRock World "
+                "Healthscience (USD), 25\"), or just the name and I'll ask for the % after."
             )
             return
 
@@ -1873,48 +1954,44 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             if not text:
                 await update.message.reply_text("Send a fund name, or type done if you're finished.")
                 return
-            resolved = fund_price_service.resolve_fund(text)
+            fund_text, inline_alloc = _split_fund_name_and_allocation(text)
+            resolved = fund_price_service.resolve_fund(fund_text)
             if resolved:
+                if inline_alloc is not None:
+                    total_alloc = _add_fund(
+                        state, resolved.display_name, resolved.code, resolved.currency, inline_alloc
+                    )
+                    await update.message.reply_text(
+                        f"Added {resolved.display_name} ({resolved.currency}) at {inline_alloc:.0f}% "
+                        f"({total_alloc:.0f}% allocated so far). Send the next fund, or tap Done if that's all.",
+                        reply_markup=_done_fund_keyboard(),
+                    )
+                    return
                 state["pending_fund"] = {
                     "name": resolved.display_name, "code": resolved.code, "currency": resolved.currency,
                 }
-                state["step"] = "confirm_fund_match"
+                state["step"] = "fund_allocation"
                 await update.message.reply_text(
-                    f"Found it — {resolved.display_name} ({resolved.currency}). Is that the right fund? (yes/no)"
+                    f"Matched: {resolved.display_name} ({resolved.currency}). What's its allocation %? "
+                    "(Not the right fund? Reply \"no\" to try the name again.)"
                 )
             else:
-                state["pending_fund_name"] = text
+                state["pending_fund_name"] = fund_text
+                state["pending_fund_allocation"] = inline_alloc
                 state["step"] = "awaiting_fund_code"
                 await update.message.reply_text(
-                    f"I don't have '{text}' in my fund directory yet. Reply with its security code and "
+                    f"I don't have '{fund_text}' in my fund directory yet. Reply with its security code and "
                     "currency from the fund's page on fundprices.insurance.hsbc.com.sg, like "
                     "`F0GBR04K8L USD`, or type skip to leave this fund out."
                 )
             return
 
-        if step == "confirm_fund_match":
-            answer = text.lower()
-            if answer in {"yes", "y", "yeah", "yep", "correct", "right"}:
-                state["step"] = "fund_allocation"
-                await update.message.reply_text("Great — what's its allocation %? (e.g. 25)")
-                return
-            if answer in {"no", "n", "nope", "wrong"}:
-                state.pop("pending_fund", None)
-                state["step"] = "fund_name"
-                await update.message.reply_text(
-                    "Okay, scratch that match. Send the fund name again — try matching the exact name "
-                    "from fundprices.insurance.hsbc.com.sg (e.g. include the fund house or currency) so I "
-                    "pick the right one, or type done if that's all."
-                )
-                return
-            await update.message.reply_text("Reply yes or no — is that the right fund?")
-            return
-
         if step == "awaiting_fund_code":
             if text.lower() == "skip":
                 state.pop("pending_fund_name", None)
+                state.pop("pending_fund_allocation", None)
                 state["step"] = "fund_name"
-                await update.message.reply_text("Okay, skipped. Send the next fund's name, or type done if that's all.")
+                await update.message.reply_text("Okay, skipped. Send the next fund, or type done if that's all.")
                 return
             parts = text.split()
             if len(parts) != 2:
@@ -1925,6 +2002,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             code, currency = parts
             fund_name = state.pop("pending_fund_name", text)
             fund_price_service.remember_fund(fund_name, code, currency)
+            inline_alloc = state.pop("pending_fund_allocation", None)
+            if inline_alloc is not None:
+                total_alloc = _add_fund(state, fund_name, code, currency.upper(), inline_alloc)
+                state["step"] = "fund_name"
+                await update.message.reply_text(
+                    f"Got it — saved {fund_name} ({currency.upper()}) for future reports, and added it at "
+                    f"{inline_alloc:.0f}% ({total_alloc:.0f}% allocated so far). Send the next fund, or tap "
+                    "Done if that's all.",
+                    reply_markup=_done_fund_keyboard(),
+                )
+                return
             state["pending_fund"] = {"name": fund_name, "code": code, "currency": currency.upper()}
             state["step"] = "fund_allocation"
             await update.message.reply_text(
@@ -1933,6 +2021,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             return
 
         if step == "fund_allocation":
+            if text.lower() in {"no", "wrong", "cancel"}:
+                state.pop("pending_fund", None)
+                state["step"] = "fund_name"
+                await update.message.reply_text(
+                    "Okay, scratch that match. Send the fund name again — try including the fund house or "
+                    "currency so I pick the right one, or type done if that's all."
+                )
+                return
             alloc = _parse_amount(text)
             if alloc is None:
                 await update.message.reply_text("Couldn't read that as a number — what's this fund's allocation %?")
@@ -1942,13 +2038,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 state["step"] = "fund_name"
                 await update.message.reply_text("Something went wrong — send the fund name again.")
                 return
-            pending_fund["allocation_pct"] = alloc
-            state["funds"].append(pending_fund)
+            total_alloc = _add_fund(
+                state, pending_fund["name"], pending_fund["code"], pending_fund["currency"], alloc
+            )
             state["step"] = "fund_name"
-            total_alloc = sum(f["allocation_pct"] for f in state["funds"])
             await update.message.reply_text(
                 f"Added {pending_fund['name']} at {alloc:.0f}% ({total_alloc:.0f}% allocated so far). "
-                "Send the next fund's name, or tap Done if that's all.",
+                "Send the next fund, or tap Done if that's all.",
                 reply_markup=_done_fund_keyboard(),
             )
             return
