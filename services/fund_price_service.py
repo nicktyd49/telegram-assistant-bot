@@ -54,6 +54,29 @@ REQUEST_TIMEOUT = 30
 PRICE_FETCH_RETRIES = 2
 PRICE_FETCH_RETRY_DELAY_SECONDS = 1.5
 
+# One /fundupdate report fetches 3 dates (commencement, anniversary, current)
+# per fund in a tight loop with zero pacing of its own (see bot.py's
+# _fetch_fund_rows_and_draft) - a report with several funds fires 20-30+
+# requests at HSBC's API back to back. Seen in practice: several funds in
+# the SAME run all come back with the thin {'Id': ...}-only payload (no
+# HistoryDetail) even after their own per-fund retries above ran out -
+# consistent with a short per-IP rate limit that stays saturated across the
+# whole burst, which a flat 1.5s per-fund retry delay doesn't reliably
+# outlast once enough funds are already queued up behind it. _pace_request()
+# enforces a minimum gap between every outbound call this module makes,
+# across all funds and all retries, not just within one fund's own retries.
+MIN_REQUEST_INTERVAL_SECONDS = 0.6
+_last_request_at = 0.0
+
+
+def _pace_request() -> None:
+    global _last_request_at
+    now = time.monotonic()
+    wait = MIN_REQUEST_INTERVAL_SECONDS - (now - _last_request_at)
+    if wait > 0:
+        time.sleep(wait)
+    _last_request_at = time.monotonic()
+
 # Seed directory: fund display name -> (security id, currency). Keys are
 # matched case-insensitively and by loose substring, so Nic doesn't have to
 # type the exact registered name. Extend this list directly whenever a new
@@ -319,7 +342,11 @@ def fetch_price(code: str, currency: str, target_date: date) -> FundPricePoint:
     last_error: Optional[FundPriceError] = None
     for attempt in range(PRICE_FETCH_RETRIES + 1):
         if attempt:
-            time.sleep(PRICE_FETCH_RETRY_DELAY_SECONDS)
+            # Back off a bit more on each retry (1.5s, then 3s) rather than a
+            # flat delay - if this really is rate-limiting, the first retry
+            # landing in the same saturated window just burns it for nothing.
+            time.sleep(PRICE_FETCH_RETRY_DELAY_SECONDS * attempt)
+        _pace_request()
         try:
             resp = requests.get(API_URL, params=params, timeout=REQUEST_TIMEOUT)
             resp.raise_for_status()
