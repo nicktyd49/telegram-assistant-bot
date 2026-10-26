@@ -1338,22 +1338,37 @@ def _add_fund(state: dict, name: str, code: str, currency: str, allocation_pct: 
     return sum(f["allocation_pct"] for f in state["funds"])
 
 
+def _fund_price_retry_keyboard() -> InlineKeyboardMarkup:
+    """Shown when one or more funds in an active Fund Update session failed
+    to price - lets Nic retry just the failed fund(s) without re-keying the
+    whole report. Policy details and every fund he's already entered stay
+    on the session either way; only the pricing step repeats."""
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Retry failed fund(s)", callback_data="fundpriceretry")]])
+
+
 async def _fetch_fund_rows_and_draft(message, chat_id: int, state: dict) -> None:
     """Fetches live fund prices right after Remarks (so real performance
     numbers exist before any drafting happens, and _build_fund_update
     doesn't have to fetch them again), then asks fund_commentary_service to
-    draft Action Notes / Market Update / Outlook from those numbers. On
-    success, stores the fetched rows + draft on the session and moves into
-    the review-each-section flow (accept / skip / override). On any
-    drafting failure (no API key, bad response, etc.) it falls back to the
-    pre-existing manual entry steps so a Claude hiccup never blocks the
-    report."""
+    draft Action Notes / Market Update / Outlook from those numbers.
+
+    Successfully-priced funds are cached on the session by index
+    (state["_fund_rows_by_index"]), and only the funds still missing one
+    get (re)fetched here - so when HSBC's API drops a few funds (see
+    fund_price_service's burst-pacing notes) and Nic taps Retry, he isn't
+    re-paying for the ones that already came through, and nothing he's
+    already typed for this report gets lost. If funds are still missing
+    after this attempt, the session is kept (not popped) and a Retry
+    button + skip/cancel instructions go out instead of dead-ending the
+    whole report and forcing a full re-key.
+
+    On full success, stores the fetched rows + draft on the session and
+    moves into the review-each-section flow (accept / skip / override)."""
     data = state["data"]
     funds_in = state["funds"]
     remarks = state.get("remarks") or []
 
     await message.chat.send_action("typing")
-    await message.reply_text(f"Fetching live prices for {len(funds_in)} fund(s) from HSBC — one moment...")
 
     commencement = data["commencement_date"]
     try:
@@ -1361,36 +1376,65 @@ async def _fetch_fund_rows_and_draft(message, chat_id: int, state: dict) -> None
     except ValueError:
         anniversary = commencement + timedelta(days=365)
     current = date.today()
+    state["_commencement"] = commencement
+    state["_anniversary"] = anniversary
+    state["_current"] = current
 
-    fund_rows = []
-    errors = []
-    for i, f in enumerate(funds_in):
+    fund_rows_by_index: dict = state.get("_fund_rows_by_index") or {}
+    pending_indices = [i for i in range(len(funds_in)) if i not in fund_rows_by_index]
+    await message.reply_text(f"Fetching live prices for {len(pending_indices)} fund(s) from HSBC — one moment...")
+
+    errors: dict = {}
+    for i in pending_indices:
+        f = funds_in[i]
         try:
             prices = fund_price_service.fetch_prices(f["code"], f["currency"], [commencement, anniversary, current])
         except fund_price_service.FundPriceError as exc:
-            errors.append(f"{f['name']}: {exc}")
+            errors[i] = f"{f['name']}: {exc}"
             continue
         display_name = f["name"] if "(" in f["name"] else f"{f['name']} ({f['currency']})"
-        fund_rows.append(fund_update_workbook.FundRow(
+        fund_rows_by_index[i] = fund_update_workbook.FundRow(
             name=display_name,
             allocation_pct=f["allocation_pct"],
             price_commencement=prices[commencement].value,
             price_anniversary=prices[anniversary].value,
             price_current=prices[current].value,
             remark=remarks[i] if i < len(remarks) else None,
-        ))
+        )
+
+    state["_fund_rows_by_index"] = fund_rows_by_index
 
     if errors:
-        await message.reply_text("Some funds couldn't be priced:\n" + "\n".join(errors))
+        state["_fund_price_errors"] = errors
+        state["step"] = "fund_price_retry"
+        pending_fund_update_session[chat_id] = state
+        await message.reply_text(
+            f"Priced {len(fund_rows_by_index)}/{len(funds_in)} fund(s). These didn't come through:\n"
+            + "\n".join(errors.values())
+            + "\n\nTap Retry to try them again, reply skip to continue the report without them, "
+            "or cancel to drop this report.",
+            reply_markup=_fund_price_retry_keyboard(),
+        )
+        return
+
+    fund_rows = [fund_rows_by_index[i] for i in range(len(funds_in))]
+    await _draft_commentary_from_rows(message, chat_id, state, fund_rows)
+
+
+async def _draft_commentary_from_rows(message, chat_id: int, state: dict, fund_rows: list) -> None:
+    """Shared tail of the pricing step: drafts Action Notes / Market Update
+    / Outlook from whichever fund rows ended up priced, then moves into the
+    review-each-section flow. Split out from _fetch_fund_rows_and_draft so
+    the "skip, continue without the failed fund(s)" path from the
+    fund_price_retry step can reuse it without re-fetching anything."""
+    data = state["data"]
     if not fund_rows:
-        await message.reply_text("Couldn't build the report — no fund prices came back.", reply_markup=main_menu_keyboard())
-        pending_fund_update_session.pop(chat_id, None)
+        await message.reply_text(
+            "Can't build a report with zero funds priced — tap Retry to try again, or type cancel to drop this report."
+        )
         return
 
     state["_fund_rows"] = fund_rows
-    state["_commencement"] = commencement
-    state["_anniversary"] = anniversary
-    state["_current"] = current
 
     try:
         draft = await fund_commentary_service.draft_commentary(
@@ -1427,6 +1471,20 @@ async def _fetch_fund_rows_and_draft(message, chat_id: int, state: dict) -> None
         "Here's a draft Action Note:\n\n" + draft["action_notes"] +
         "\n\nReply ok to accept, skip to leave it blank, or type your own replacement."
     )
+
+
+async def fund_price_retry_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not _is_allowed(update):
+        await query.answer()
+        return
+    await query.answer()
+    chat_id = update.effective_chat.id
+    state = pending_fund_update_session.get(chat_id)
+    if not state or state.get("step") != "fund_price_retry":
+        await query.message.reply_text("There's no fund-update pricing retry pending right now.")
+        return
+    await _fetch_fund_rows_and_draft(query.message, chat_id, state)
 
 
 async def _build_fund_update(message, chat_id: int, state: Optional[dict] = None) -> None:
@@ -2056,6 +2114,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 remark_list = [r.strip() for r in re.split(r"[,\n]", text) if r.strip()]
                 state["remarks"] = remark_list
             await _fetch_fund_rows_and_draft(update.message, chat_id, state)
+            return
+
+        if step == "fund_price_retry":
+            if text.lower() == "cancel":
+                pending_fund_update_session.pop(chat_id, None)
+                await update.message.reply_text("Report dropped.", reply_markup=main_menu_keyboard())
+                return
+            if text.lower() == "skip":
+                fund_rows_by_index = state.get("_fund_rows_by_index") or {}
+                fund_rows = [fund_rows_by_index[i] for i in sorted(fund_rows_by_index)]
+                await _draft_commentary_from_rows(update.message, chat_id, state, fund_rows)
+                return
+            await update.message.reply_text(
+                "Tap Retry to try the failed fund(s) again, reply skip to continue without them, "
+                "or cancel to drop this report.",
+                reply_markup=_fund_price_retry_keyboard(),
+            )
             return
 
         # Draft shown, Nic accepts/skips/overrides each section in turn —
@@ -3003,6 +3078,7 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(ig_discard_callback, pattern=r"^igdiscard$"))
     app.add_handler(CallbackQueryHandler(fund_done_callback, pattern=r"^funddone$"))
     app.add_handler(CallbackQueryHandler(fund_undo_callback, pattern=r"^fundundo$"))
+    app.add_handler(CallbackQueryHandler(fund_price_retry_callback, pattern=r"^fundpriceretry$"))
     app.add_handler(MessageHandler(filters.Document.PDF, handle_policy_or_receipt_pdf))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.Document.ALL & ~filters.Document.PDF, handle_generic_document))
