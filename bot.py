@@ -13,9 +13,11 @@ from pathlib import Path
 from typing import Optional
 from zoneinfo import ZoneInfo
 
+import httpx
 import telegram.error
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, BotCommand, InputMediaPhoto
 from telegram.constants import ParseMode, ChatType
+from telegram.request import HTTPXRequest
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -2947,8 +2949,29 @@ async def _post_init(app: Application) -> None:
     ])
 
 
+def _build_resilient_request() -> HTTPXRequest:
+    """A plain HTTPXRequest doesn't retry a connection attempt that fails
+    outright (httpx.ConnectError) - one dropped/refused TCP handshake on
+    Railway's outbound path to Telegram surfaces straight to error_handler
+    as "something broke", even though the very next attempt usually
+    succeeds on its own. Wrapping the transport with retries=2 makes httpx
+    retry just the connection establishment (not the whole API call
+    semantics) before giving up, and the 10s connect_timeout (PTB's default
+    is 5s) gives a slow handshake more room before it's judged failed."""
+    request = HTTPXRequest(connect_timeout=10.0)
+    request._client_kwargs["transport"] = httpx.AsyncHTTPTransport(retries=2)
+    request._client = request._build_client()
+    return request
+
+
 def main() -> None:
-    app = Application.builder().token(settings.telegram_bot_token).post_init(_post_init).build()
+    app = (
+        Application.builder()
+        .token(settings.telegram_bot_token)
+        .request(_build_resilient_request())
+        .post_init(_post_init)
+        .build()
+    )
     app.add_error_handler(error_handler)
     if app.job_queue is not None:
         app.job_queue.run_repeating(
