@@ -7,6 +7,7 @@ import json
 import logging
 import re
 import traceback
+from dataclasses import asdict, is_dataclass
 from datetime import datetime, timedelta, date, time as dt_time, timezone
 from io import BytesIO
 from pathlib import Path
@@ -105,7 +106,129 @@ pending_ig_preview: dict[int, dict] = {}
 # }
 # Fund prices are fetched live from HSBC only once the whole session is
 # complete (see _build_fund_update) — nothing is fetched question-by-question.
-pending_fund_update_session: dict[int, dict] = {}
+FUND_UPDATE_SESSIONS_PATH = "_bot_tmp/fundupdate_sessions.json"
+# Classes that can appear as values inside a fund-update session and need
+# special JSON handling. Add here if a new dataclass ever gets stored in
+# session state.
+_SESSION_DATACLASSES = {"FundRow": fund_update_workbook.FundRow}
+
+
+def _encode_session_value(value):
+    """Turns a fund-update session's value tree into plain JSON-safe data -
+    recursing through dicts/lists and converting the two non-JSON types
+    that actually show up in this state (date, and the FundRow dataclass)
+    into a small tagged dict that _decode_session_value can reverse."""
+    if isinstance(value, datetime):
+        return {"__datetime__": value.isoformat()}
+    if isinstance(value, date):
+        return {"__date__": value.isoformat()}
+    if is_dataclass(value) and not isinstance(value, type):
+        return {"__dataclass__": type(value).__name__,
+                "fields": {k: _encode_session_value(v) for k, v in asdict(value).items()}}
+    if isinstance(value, dict):
+        return {k: _encode_session_value(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_encode_session_value(v) for v in value]
+    return value
+
+
+def _decode_session_value(value):
+    """Reverses _encode_session_value. Any dict key this function doesn't
+    recognize as one of the tagged shapes above is assumed to be ordinary
+    session data and is walked as a plain dict, so adding new plain
+    fields to the session never needs a matching change here."""
+    if isinstance(value, dict):
+        if set(value.keys()) == {"__datetime__"}:
+            return datetime.fromisoformat(value["__datetime__"])
+        if set(value.keys()) == {"__date__"}:
+            return date.fromisoformat(value["__date__"])
+        if "__dataclass__" in value:
+            cls = _SESSION_DATACLASSES.get(value["__dataclass__"])
+            fields = {k: _decode_session_value(v) for k, v in value.get("fields", {}).items()}
+            return cls(**fields) if cls else fields
+        return {k: _decode_session_value(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_decode_session_value(v) for v in value]
+    return value
+
+
+async def _save_fund_update_sessions() -> None:
+    """Writes every in-progress /fundupdate session to a single OneDrive
+    blob, keyed by chat id. Best-effort: if OneDrive isn't configured, or
+    the upload fails, this just logs and moves on - never blocks a reply
+    going out over a persistence hiccup."""
+    if not settings.onedrive_configured:
+        return
+    try:
+        payload = {
+            str(chat_id): _encode_session_value(state)
+            for chat_id, state in dict(pending_fund_update_session).items()
+        }
+        await onedrive_service.upload_bytes(FUND_UPDATE_SESSIONS_PATH, json.dumps(payload).encode("utf-8"))
+    except Exception:  # noqa: BLE001
+        logger.exception("Could not persist in-progress fund-update session(s) to OneDrive")
+
+
+def _schedule_fund_update_session_save() -> None:
+    """Fires the OneDrive save as a background task rather than awaiting it
+    inline, since dict.__setitem__/pop can't be async and nothing in the
+    wizard should wait on a network round-trip just to keep its own
+    in-memory state in sync. Only called while the bot's event loop is
+    actually running (every real call site is inside an async handler);
+    the RuntimeError guard just covers the harmless edge of constructing
+    the dict itself before any loop exists."""
+    try:
+        asyncio.get_running_loop().create_task(_save_fund_update_sessions())
+    except RuntimeError:
+        pass
+
+
+async def _restore_fund_update_sessions() -> None:
+    """Called once from _post_init, right after startup. A Railway redeploy
+    wipes this process's memory (and its local disk - nothing here
+    survives a redeploy except what's on OneDrive), so without this, every
+    fund-update report in progress at the moment of a redeploy would
+    silently vanish mid-conversation with no warning to Nic. Restoring
+    here means that within moments of the new container coming up, the
+    exact same session is back and his next message picks up right where
+    he left off."""
+    if not settings.onedrive_configured:
+        return
+    try:
+        data = await onedrive_service.download_bytes(FUND_UPDATE_SESSIONS_PATH)
+        if not data:
+            return
+        payload = json.loads(data)
+        for chat_id_str, encoded_state in payload.items():
+            pending_fund_update_session[int(chat_id_str)] = _decode_session_value(encoded_state)
+        if payload:
+            logger.info(
+                "Restored %d in-progress fund-update session(s) from OneDrive after restart",
+                len(payload),
+            )
+    except Exception:  # noqa: BLE001
+        logger.exception("Could not restore in-progress fund-update session(s) from OneDrive")
+
+
+class _PersistentFundUpdateSessions(dict):
+    """Drop-in replacement for the plain session dict - every write or
+    delete also schedules a save to OneDrive (see
+    _schedule_fund_update_session_save), so the hundred-plus existing call
+    sites that already do `pending_fund_update_session[chat_id] = state`
+    or `.pop(chat_id, None)` throughout this file get persistence for
+    free, with no change needed at any of them."""
+
+    def __setitem__(self, key, value):
+        super().__setitem__(key, value)
+        _schedule_fund_update_session_save()
+
+    def pop(self, key, *default):
+        result = super().pop(key, *default)
+        _schedule_fund_update_session_save()
+        return result
+
+
+pending_fund_update_session: dict[int, dict] = _PersistentFundUpdateSessions()
 
 
 def _trim_history(history: list[dict]) -> None:
@@ -3022,6 +3145,7 @@ async def _post_init(app: Application) -> None:
         BotCommand("menu", "Show the tap-to-use buttons"),
         BotCommand("help", "What I can do"),
     ])
+    await _restore_fund_update_sessions()
 
 
 def _build_resilient_request() -> HTTPXRequest:
