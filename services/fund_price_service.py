@@ -110,6 +110,7 @@ SEED_FUNDS: dict[str, dict] = {
     "AB SICAV I - Emerging Markets Multi-Asset Portfolio AD USD Inc": {"code": "F00000PQ4C", "currency": "USD"},
     "Franklin Income Fund A(Mdis)USD": {"code": "F0GBR04ARS", "currency": "USD"},
     "PIMCO GIS Income Fund Administrative USD Income": {"code": "F00000P78B", "currency": "USD"},
+    "PIMCO GIS Income Fund Administrative SGD (Hedged) Income": {"code": "F00000P78C", "currency": "SGD"},
     "BlackRock Global Funds - Global Allocation Fund A2": {"code": "F0GBR04AMK", "currency": "USD"},
     "HSBC Life Fortress Fund A": {"code": "F0HKG0705R", "currency": "SGD"},
     "AB FCP I - Emerging Markets Debt Portfolio A2 SGD H Acc": {"code": "F00000ME1O", "currency": "SGD"},
@@ -300,7 +301,12 @@ def resolve_fund(query: str) -> Optional[ResolvedFund]:
 
     # Loose token-overlap fallback - e.g. "blackrock healthscience" should
     # still find "BlackRock World Healthscience (USD)".
-    query_tokens = {t for t in query.lower().split() if len(t) > 2}
+    # .replace() for parens mirrors what name_tokens below already does to
+    # the directory names - without it, typing a fund with no space before
+    # a bracket (e.g. "fund(SGD Hedged)") glues "fund" and "sgd" into one
+    # token that can never match the directory's separate "fund"/"sgd"
+    # tokens, silently failing to resolve a fund that IS in the directory.
+    query_tokens = {t for t in query.lower().replace("(", " ").replace(")", " ").split() if len(t) > 2}
     best_name, best_score = None, 0
     for name in directory:
         name_tokens = {t for t in name.lower().replace("(", " ").replace(")", " ").split() if len(t) > 2}
