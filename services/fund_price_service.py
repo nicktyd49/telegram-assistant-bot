@@ -46,11 +46,27 @@ logger = logging.getLogger("assistant-bot.fund_price")
 
 API_URL = "https://fundprices.insurance.hsbc.com.sg/fund-center-api/hsbc/ts/external"
 REQUEST_TIMEOUT = 30
-# HSBC's API occasionally returns a thin/incomplete payload (Security present
-# but no HistoryDetail key at all) under the burst of several rapid requests
-# one /fundupdate report fires - re-querying the exact same code/date window
-# moments later has reliably succeeded, so this is treated as transient and
-# retried a couple of times before giving up on that fund.
+# Confirmed by hand (2026-10-30): the exact same code/date window that comes
+# back as this thin {'Id': ...}-only payload for Railway's plain `requests`
+# call returns full HistoryDetail every time when the identical URL is
+# opened in a real browser - same fund, same dates, same data available.
+# So this isn't missing history or a bad security id; it's HSBC's side
+# treating the request differently depending on how it's made. The most
+# likely culprit is requests' default headers (User-Agent: python-requests/
+# x.y, no Accept/Referer) reading as a bot/script to whatever's in front of
+# this endpoint, so every request now goes out looking like it came from an
+# actual browser visiting the Fund Center page. Kept as a retry-with-pacing
+# condition too (see PRICE_FETCH_RETRIES below) in case genuine transient
+# blips still happen on top of this.
+REQUEST_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-SG,en;q=0.9",
+    "Referer": "https://fundprices.insurance.hsbc.com.sg/",
+}
 PRICE_FETCH_RETRIES = 2
 PRICE_FETCH_RETRY_DELAY_SECONDS = 1.5
 
@@ -348,7 +364,7 @@ def fetch_price(code: str, currency: str, target_date: date) -> FundPricePoint:
             time.sleep(PRICE_FETCH_RETRY_DELAY_SECONDS * attempt)
         _pace_request()
         try:
-            resp = requests.get(API_URL, params=params, timeout=REQUEST_TIMEOUT)
+            resp = requests.get(API_URL, params=params, headers=REQUEST_HEADERS, timeout=REQUEST_TIMEOUT)
             resp.raise_for_status()
             payload = resp.json()
         except Exception as exc:  # noqa: BLE001
