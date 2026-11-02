@@ -1005,7 +1005,24 @@ async def _build_playbook(message, chat_id: int) -> None:
         else:
             calendar_note = "\n\n(Calendar isn't configured yet, so this wasn't added anywhere - see README.)"
 
-    full_reply = "\n".join(reply_lines) + calendar_note
+    onedrive_note = ""
+    if settings.onedrive_configured:
+        try:
+            safe_client = policy_workbook._onedrive_safe_name(client_name, "Unknown Client")
+            file_date = datetime.now(ZoneInfo(settings.timezone)).strftime("%Y-%m-%d")
+            remote_path = (
+                f"{policy_workbook.ONEDRIVE_WORKBOOK_FOLDER}/{safe_client}/"
+                f"Follow-Up Playbook {file_date}.txt"
+            )
+            await onedrive_service.upload_bytes(remote_path, playbook_text.encode("utf-8"))
+            onedrive_note = (
+                f"\n📁 Saved to OneDrive: Client/{safe_client}/Follow-Up Playbook {file_date}.txt"
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to save follow-up playbook to OneDrive")
+            onedrive_note = "\n⚠️ Couldn't save this playbook to OneDrive."
+
+    full_reply = "\n".join(reply_lines) + calendar_note + onedrive_note
     chunk_size = 3500
     for chunk_start in range(0, len(full_reply), chunk_size):
         is_last = chunk_start + chunk_size >= len(full_reply)
