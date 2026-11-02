@@ -30,7 +30,7 @@ from telegram.ext import (
 
 from config import settings
 from assistant import anthropic_client, run_conversation
-from services import calendar_service, sheets_service, pdf_utils, policy_workbook, policy_illustration, onedrive_service, action_plan, client_pairing, news_service, poster_service, ig_post_service, fund_price_service, fund_update_workbook, fund_commentary_service
+from services import calendar_service, sheets_service, pdf_utils, policy_workbook, policy_illustration, onedrive_service, action_plan, client_pairing, news_service, poster_service, ig_post_service, fund_price_service, fund_update_workbook, fund_commentary_service, playbook_service
 from prompts import RECEIPT_EXTRACTION_PROMPT, POLICY_FIELDS_EXTRACTION_PROMPT
 
 MAX_HISTORY_MESSAGES = 40
@@ -51,6 +51,7 @@ MENU_NEWS = "📰 News"
 MENU_POSTER = "📊 Market Poster"
 MENU_IG = "📸 IG Post"
 MENU_FUND_UPDATE = "📈 Fund Update"
+MENU_PLAYBOOK = "🎯 Follow-Up Playbook"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("assistant-bot")
@@ -93,6 +94,7 @@ pending_poster_preview: dict[int, dict] = {}
 # ask Claude for a fresh caption without needing the photo resent).
 pending_ig_session: dict[int, dict] = {}
 pending_ig_preview: dict[int, dict] = {}
+pending_playbook_session: dict[int, dict] = {}
 
 # In-memory per-chat "Fund Update" session state (ILP Funds Update report).
 # Maps chat_id -> {
@@ -316,7 +318,7 @@ def main_menu_keyboard() -> ReplyKeyboardMarkup:
     """The persistent row of buttons at the bottom of the chat."""
     return ReplyKeyboardMarkup(
         [[MENU_CALENDAR, MENU_RECEIPT], [MENU_POLICY, MENU_FILE], [MENU_NEWS, MENU_POSTER],
-         [MENU_IG, MENU_FUND_UPDATE], [MENU_HELP]],
+         [MENU_IG, MENU_FUND_UPDATE], [MENU_PLAYBOOK, MENU_HELP]],
         resize_keyboard=True,
     )
 
@@ -361,6 +363,11 @@ def _poster_review_keyboard() -> InlineKeyboardMarkup:
 def _done_ig_keyboard() -> InlineKeyboardMarkup:
     """Shown while an 'IG Post' note-collection session is active."""
     return InlineKeyboardMarkup([[InlineKeyboardButton("✅ Create Post", callback_data="igdone")]])
+
+
+def _done_playbook_keyboard() -> InlineKeyboardMarkup:
+    """Shown while a 'Follow-Up Playbook' collection session is active."""
+    return InlineKeyboardMarkup([[InlineKeyboardButton("✅ Build Playbook", callback_data="playbookdone")]])
 
 
 def _ig_review_keyboard() -> InlineKeyboardMarkup:
@@ -936,6 +943,87 @@ async def ig_done_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     await _build_ig_post(query.message, update.effective_chat.id)
 
 
+async def _build_playbook(message, chat_id: int) -> None:
+    """Shared by the 'done' text command and the ✅ Build Playbook button -
+    takes whatever's been collected (pasted text and/or screenshots) for a
+    Follow-Up Playbook session, asks Claude for a structured playbook, replies
+    with it in chat, and - when Google Calendar is configured - adds a
+    calendar event on the suggested follow-up date with the full playbook in
+    the event description, so it's there when Nic opens the event later."""
+    state = pending_playbook_session.pop(chat_id, None)
+    if not state:
+        await message.reply_text("That session's expired - tap 🎯 Follow-Up Playbook to start again.")
+        return
+
+    client_name = state.get("client_name") or "this prospect"
+    parts = state.get("parts", [])
+    text_parts = [p["text"] for p in parts if p["type"] == "text"]
+    image_parts = [p for p in parts if p["type"] == "image"]
+    if not text_parts and not image_parts:
+        await message.reply_text(
+            "Nothing to work with yet - paste the conversation or send a screenshot first.",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+
+    await message.chat.send_action("typing")
+    today_str = datetime.now(ZoneInfo(settings.timezone)).strftime("%A, %Y-%m-%d")
+    try:
+        data = await playbook_service.generate_playbook(
+            client_name, "\n\n".join(text_parts), image_parts, today_str,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Failed to generate follow-up playbook")
+        await message.reply_text(
+            f"Couldn't build that playbook: {exc}", reply_markup=main_menu_keyboard(),
+        )
+        return
+
+    playbook_text = playbook_service.format_playbook_text(client_name, data)
+    follow_up_date = data.get("next_followup_date", "")
+    reason = data.get("next_followup_reason", "")
+    reply_lines = [playbook_text]
+    if follow_up_date:
+        reply_lines.append(
+            f"\nSuggested follow-up date: {follow_up_date}" + (f" — {reason}" if reason else "")
+        )
+
+    calendar_note = ""
+    if follow_up_date:
+        if settings.calendar_configured:
+            try:
+                await calendar_service.create_event(
+                    title=f"Follow up with {client_name}",
+                    start_time=f"{follow_up_date}T09:00:00",
+                    end_time=f"{follow_up_date}T09:15:00",
+                    description=playbook_text,
+                )
+                calendar_note = f"\n\n✅ Added to your calendar for {follow_up_date}, 9:00 AM."
+            except Exception:  # noqa: BLE001
+                logger.exception("Failed to add follow-up playbook to calendar")
+                calendar_note = "\n\n⚠️ Couldn't add this to your calendar - here's the playbook anyway."
+        else:
+            calendar_note = "\n\n(Calendar isn't configured yet, so this wasn't added anywhere - see README.)"
+
+    full_reply = "\n".join(reply_lines) + calendar_note
+    chunk_size = 3500
+    for chunk_start in range(0, len(full_reply), chunk_size):
+        is_last = chunk_start + chunk_size >= len(full_reply)
+        await message.reply_text(
+            full_reply[chunk_start:chunk_start + chunk_size],
+            reply_markup=main_menu_keyboard() if is_last else None,
+        )
+
+
+async def playbook_done_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not _is_allowed(update):
+        await query.answer()
+        return
+    await query.answer()
+    await _build_playbook(query.message, update.effective_chat.id)
+
+
 async def ig_regen_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     if not _is_allowed(update):
@@ -1254,6 +1342,26 @@ async def _menu_ig(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "you like, or I'll ask before writing the caption. Tap ✅ Create Post below when you're "
         "done with photos.",
         reply_markup=_done_ig_keyboard(),
+    )
+
+
+async def _menu_playbook(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Starts a 'Follow-Up Playbook' session - asks who it's for, then collects
+    pasted/forwarded conversation text and/or screenshots until Done is
+    tapped, then builds a full follow-up playbook (status summary, next
+    follow-up date, drafted message, reply-scenario guidance) via Claude and
+    adds it straight to the Google Calendar (see _build_playbook)."""
+    chat_id = update.effective_chat.id
+    pending_policy.pop(chat_id, None)
+    pending_policy_session.pop(chat_id, None)
+    pending_client_files.pop(chat_id, None)
+    pending_poster_session.pop(chat_id, None)
+    pending_ig_session.pop(chat_id, None)
+    pending_ig_preview.pop(chat_id, None)
+    pending_fund_update_session.pop(chat_id, None)
+    pending_playbook_session[chat_id] = {"step": "name", "client_name": None, "parts": []}
+    await update.message.reply_text(
+        "Who's this follow-up for? Send the prospect/client's name."
     )
 
 
@@ -1729,6 +1837,7 @@ MENU_ACTIONS = {
     MENU_POSTER: _menu_poster,
     MENU_IG: _menu_ig,
     MENU_FUND_UPDATE: _menu_fund_update,
+    MENU_PLAYBOOK: _menu_playbook,
     MENU_HELP: help_command,
 }
 
@@ -1820,6 +1929,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             pending_ig_preview.pop(chat_id, None)
         if text_raw != MENU_FUND_UPDATE:
             pending_fund_update_session.pop(chat_id, None)
+        if text_raw != MENU_PLAYBOOK:
+            pending_playbook_session.pop(chat_id, None)
         await MENU_ACTIONS[text_raw](update, context)
         return
 
@@ -1913,6 +2024,35 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             f"{revised}\n\n—\nCaption above - copy it, save the photo(s), and post both yourself. "
             "Want another change? Just tell me, or tap 🔁 Regenerate for a fresh take.",
             reply_markup=_ig_review_keyboard(),
+        )
+        return
+
+    if chat_id in pending_playbook_session:
+        pb_state = pending_playbook_session[chat_id]
+        pb_text = text_raw.strip()
+
+        if pb_state["step"] == "name":
+            if not pb_text:
+                await update.message.reply_text("Who's this follow-up for? Send the prospect/client's name.")
+                return
+            pb_state["client_name"] = pb_text
+            pb_state["step"] = "collecting"
+            await update.message.reply_text(
+                f"Got it — {pb_text}. Now paste or forward the conversation (text), and/or send "
+                "screenshot(s) of the chat. Send as many as you like, then tap ✅ Build Playbook "
+                "below when you're done.",
+                reply_markup=_done_playbook_keyboard(),
+            )
+            return
+
+        if pb_text.lower() in {"done", "finish"}:
+            await _build_playbook(update.message, chat_id)
+            return
+        pb_state["parts"].append({"type": "text", "text": text_raw})
+        pb_count = len(pb_state["parts"])
+        await update.message.reply_text(
+            f"Got it ({pb_count} item(s) so far). Send more, or tap ✅ Build Playbook to finish.",
+            reply_markup=_done_playbook_keyboard(),
         )
         return
 
@@ -2425,6 +2565,18 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         # "Got it..." message each, which could trip Telegram's flood control
         # on a fast multi-photo send. Just collect silently; the original
         # prompt's ✅ Create Post button (or typing "done") finishes the session.
+        return
+
+    if chat_id in pending_playbook_session and pending_playbook_session[chat_id]["step"] == "collecting":
+        image_b64_pb = base64.b64encode(image_bytes).decode("ascii")
+        pending_playbook_session[chat_id]["parts"].append(
+            {"type": "image", "media_type": "image/jpeg", "data": image_b64_pb}
+        )
+        pb_count = len(pending_playbook_session[chat_id]["parts"])
+        await update.message.reply_text(
+            f"Got it ({pb_count} item(s) so far). Send more, or tap ✅ Build Playbook to finish.",
+            reply_markup=_done_playbook_keyboard(),
+        )
         return
 
     caption_raw = (update.message.caption or "").strip()
@@ -3187,6 +3339,7 @@ def main() -> None:
     app.add_handler(CommandHandler("poster", _menu_poster))
     app.add_handler(CommandHandler("igpost", _menu_ig))
     app.add_handler(CommandHandler("fundupdate", _menu_fund_update))
+    app.add_handler(CommandHandler("playbook", _menu_playbook))
     app.add_handler(CommandHandler("groupid", groupid_command))
     app.add_handler(CommandHandler("menu", menu_command))
     app.add_handler(CallbackQueryHandler(calendar_callback, pattern=r"^cal:"))
@@ -3203,6 +3356,7 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(fund_done_callback, pattern=r"^funddone$"))
     app.add_handler(CallbackQueryHandler(fund_undo_callback, pattern=r"^fundundo$"))
     app.add_handler(CallbackQueryHandler(fund_price_retry_callback, pattern=r"^fundpriceretry$"))
+    app.add_handler(CallbackQueryHandler(playbook_done_callback, pattern=r"^playbookdone$"))
     app.add_handler(MessageHandler(filters.Document.PDF, handle_policy_or_receipt_pdf))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.Document.ALL & ~filters.Document.PDF, handle_generic_document))
