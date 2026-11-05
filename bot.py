@@ -1621,16 +1621,17 @@ async def _fetch_fund_rows_and_draft(message, chat_id: int, state: dict) -> None
     commencement = data["commencement_date"]
     current = date.today()
     try:
-        anniversary = date(commencement.year + 1, commencement.month, commencement.day)
+        anniversary = date(current.year - 1, current.month, current.day)
     except ValueError:
-        anniversary = commencement + timedelta(days=365)
-    if anniversary > current:
-        # Policy hasn't reached its 1st anniversary yet - HSBC has no price
-        # data for a future date (that's the "Unexpected response shape"/
-        # missing-HistoryDetail error Nic hit), and retrying can never fix
-        # it since the date itself is the problem. Cap it at today instead
-        # of failing the whole report over a policy that's just young.
-        anniversary = current
+        anniversary = current - timedelta(days=365)
+    # "Anniversary" here means trailing 12 months as of today (today's date,
+    # one year ago) - not commencement + 1 year. That's a deliberate call:
+    # computing it off commencement instead could land in the future for a
+    # policy under a year old, which HSBC has no price data for yet (that
+    # was the "Unexpected response shape" error Nic hit) - and retrying
+    # can never fix a future date, since the date itself is the problem.
+    # Basing it on today instead means it's never in the future, no matter
+    # how new the policy is.
     state["_commencement"] = commencement
     state["_anniversary"] = anniversary
     state["_current"] = current
@@ -1773,12 +1774,11 @@ async def _build_fund_update(message, chat_id: int, state: Optional[dict] = None
         commencement = data["commencement_date"]
         current = date.today()
         try:
-            anniversary = date(commencement.year + 1, commencement.month, commencement.day)
+            anniversary = date(current.year - 1, current.month, current.day)
         except ValueError:
-            anniversary = commencement + timedelta(days=365)
-        if anniversary > current:
-            # Same future-anniversary guard as _fetch_fund_rows_and_draft above.
-            anniversary = current
+            anniversary = current - timedelta(days=365)
+        # Same trailing-12-months-as-of-today definition as
+        # _fetch_fund_rows_and_draft above - see the comment there.
 
         fund_rows = []
         errors = []
