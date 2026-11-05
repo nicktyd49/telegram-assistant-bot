@@ -1636,7 +1636,17 @@ async def _fetch_fund_rows_and_draft(message, chat_id: int, state: dict) -> None
     state["_anniversary"] = anniversary
     state["_current"] = current
 
-    fund_rows_by_index: dict = state.get("_fund_rows_by_index") or {}
+    # Keys come back as strings after a round-trip through OneDrive (JSON
+    # object keys are always strings), so normalize to int here - otherwise
+    # `i not in fund_rows_by_index` (i is always an int from range()) never
+    # matches a restored entry, every fund looks "still pending" after a
+    # redeploy, and already-priced funds get re-fetched and re-added under
+    # new int keys alongside their old never-matched string-keyed entries,
+    # inflating the count past len(funds_in) (seen as "Priced 6/4").
+    fund_rows_by_index: dict = {
+        int(k): v for k, v in (state.get("_fund_rows_by_index") or {}).items()
+        if 0 <= int(k) < len(funds_in)
+    }
     pending_indices = [i for i in range(len(funds_in)) if i not in fund_rows_by_index]
     await message.reply_text(f"Fetching live prices for {len(pending_indices)} fund(s) from HSBC — one moment...")
 
@@ -2412,7 +2422,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 await update.message.reply_text("Report dropped.", reply_markup=main_menu_keyboard())
                 return
             if text.lower() == "skip":
-                fund_rows_by_index = state.get("_fund_rows_by_index") or {}
+                # Same string-vs-int key normalization as _fetch_fund_rows_and_draft above.
+                fund_rows_by_index = {
+                    int(k): v for k, v in (state.get("_fund_rows_by_index") or {}).items()
+                    if 0 <= int(k) < len(state["funds"])
+                }
                 fund_rows = [fund_rows_by_index[i] for i in sorted(fund_rows_by_index)]
                 await _draft_commentary_from_rows(update.message, chat_id, state, fund_rows)
                 return
