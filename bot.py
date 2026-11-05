@@ -1619,11 +1619,18 @@ async def _fetch_fund_rows_and_draft(message, chat_id: int, state: dict) -> None
     await message.chat.send_action("typing")
 
     commencement = data["commencement_date"]
+    current = date.today()
     try:
         anniversary = date(commencement.year + 1, commencement.month, commencement.day)
     except ValueError:
         anniversary = commencement + timedelta(days=365)
-    current = date.today()
+    if anniversary > current:
+        # Policy hasn't reached its 1st anniversary yet - HSBC has no price
+        # data for a future date (that's the "Unexpected response shape"/
+        # missing-HistoryDetail error Nic hit), and retrying can never fix
+        # it since the date itself is the problem. Cap it at today instead
+        # of failing the whole report over a policy that's just young.
+        anniversary = current
     state["_commencement"] = commencement
     state["_anniversary"] = anniversary
     state["_current"] = current
@@ -1764,11 +1771,14 @@ async def _build_fund_update(message, chat_id: int, state: Optional[dict] = None
         await message.reply_text(f"Fetching live prices for {len(funds_in)} fund(s) from HSBC — one moment...")
 
         commencement = data["commencement_date"]
+        current = date.today()
         try:
             anniversary = date(commencement.year + 1, commencement.month, commencement.day)
         except ValueError:
             anniversary = commencement + timedelta(days=365)
-        current = date.today()
+        if anniversary > current:
+            # Same future-anniversary guard as _fetch_fund_rows_and_draft above.
+            anniversary = current
 
         fund_rows = []
         errors = []
