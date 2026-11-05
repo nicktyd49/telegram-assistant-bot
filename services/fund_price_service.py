@@ -67,8 +67,18 @@ REQUEST_HEADERS = {
     "Accept-Language": "en-SG,en;q=0.9",
     "Referer": "https://fundprices.insurance.hsbc.com.sg/",
 }
-PRICE_FETCH_RETRIES = 2
-PRICE_FETCH_RETRY_DELAY_SECONDS = 1.5
+# Bumped from 2/1.5s after Fidelity Funds - Global Financial Services Fund
+# A-Acc-SGD (F00000WVHP) kept coming back as the thin {'Id': ...}-only
+# payload on every single one of several separate /fundupdate attempts in
+# a row - not a one-off blip within one burst, but the same fund losing
+# every time across multiple independent report runs. A manual single
+# request for this exact code/date range (outside any burst) succeeded
+# immediately both times it was tried, so the data is there; it's just
+# this fund that needs more room to land. More attempts with a longer,
+# steeper backoff gives it that room without slowing down the common case
+# (funds that succeed on the first try pay nothing extra).
+PRICE_FETCH_RETRIES = 4
+PRICE_FETCH_RETRY_DELAY_SECONDS = 2.0
 
 # One /fundupdate report fetches 3 dates (commencement, anniversary, current)
 # per fund in a tight loop with zero pacing of its own (see bot.py's
